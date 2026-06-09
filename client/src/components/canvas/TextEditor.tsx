@@ -1,8 +1,8 @@
 /**
  * 文本编辑覆盖层组件
  *
- * 当前版本由 useDrawTool 通过 DOM 直接管理编辑框，
- * 此组件仅作为过渡占位，实际编辑功能已移至 useDrawTool。
+ * 双击文本元素时显示一个可编辑的 textarea。
+ * 采用受控组件模式，输入实时同步到 store，Esc 取消，Blur/Enter 保存。
  */
 
 import { useEffect, useRef, useCallback, useState } from 'react'
@@ -19,24 +19,24 @@ export function TextEditor({ renderer, editingElementId, onFinish }: TextEditorP
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const store = useCanvasStore()
   const originalTextRef = useRef<string>('')
-  const isCancelledRef = useRef(false)
 
+  // 受控组件的本地文本值
   const [textValue, setTextValue] = useState('')
 
   const element = editingElementId
     ? store.elements.find((e) => e.id === editingElementId)
     : null
 
+  // 当进入编辑模式时，记录原文本并设置初始值
   useEffect(() => {
     if (element && editingElementId) {
-      originalTextRef.current = element.text || ''
-      isCancelledRef.current = false
-      setTextValue(element.text || '')
-    } else {
-      setTextValue('')
+      const initialText = element.text || ''
+      originalTextRef.current = initialText
+      setTextValue(initialText)
     }
   }, [editingElementId, element])
 
+  // 计算编辑框在屏幕上的位置
   const getPosition = useCallback(() => {
     if (!renderer || !element) return { left: 0, top: 0, width: 200, height: 40 }
     const screen = renderer.worldToScreen(element.x, element.y)
@@ -51,6 +51,7 @@ export function TextEditor({ renderer, editingElementId, onFinish }: TextEditorP
 
   const pos = getPosition()
 
+  // 自动聚焦并选中文本
   useEffect(() => {
     if (textareaRef.current && element && editingElementId) {
       textareaRef.current.focus()
@@ -58,44 +59,47 @@ export function TextEditor({ renderer, editingElementId, onFinish }: TextEditorP
     }
   }, [element, editingElementId])
 
+  // 实时更新：输入时同步到 store（Canvas 会立即重绘，虽然该文本被隐藏）
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setTextValue(e.target.value)
-  }, [])
+    const newValue = e.target.value
+    setTextValue(newValue)
+    if (editingElementId) {
+      store.updateElement(editingElementId, { text: newValue })
+    }
+  }, [editingElementId, store])
 
-  const handleFinish = useCallback(() => {
-    if (isCancelledRef.current) {
-      onFinish()
-      return
+  // 保存并结束编辑
+  const saveAndFinish = useCallback(() => {
+    if (editingElementId) {
+      store.updateElement(editingElementId, { text: textValue })
     }
-    if (!editingElementId) {
-      onFinish()
-      return
-    }
-    store.updateElement(editingElementId, { text: textValue })
     onFinish()
-  }, [editingElementId, store, onFinish, textValue])
+  }, [editingElementId, store, textValue, onFinish])
 
+  // 取消编辑并恢复原文本
+  const cancelAndFinish = useCallback(() => {
+    if (editingElementId) {
+      store.updateElement(editingElementId, { text: originalTextRef.current })
+    }
+    onFinish()
+  }, [editingElementId, store, onFinish])
+
+  // 键盘事件
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault()
-        handleFinish()
+        saveAndFinish()
       }
       if (e.key === 'Escape') {
-        isCancelledRef.current = true
-        if (editingElementId) {
-          store.updateElement(editingElementId, { text: originalTextRef.current })
-        }
-        onFinish()
+        e.preventDefault()
+        cancelAndFinish()
       }
     },
-    [onFinish, editingElementId, store, handleFinish]
+    [saveAndFinish, cancelAndFinish]
   )
 
-  const handleBlur = useCallback(() => {
-    handleFinish()
-  }, [handleFinish])
-
+  // 阻止编辑框内部事件冒泡到 canvas
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     e.stopPropagation()
   }, [])
@@ -107,7 +111,7 @@ export function TextEditor({ renderer, editingElementId, onFinish }: TextEditorP
       ref={textareaRef}
       value={textValue}
       onChange={handleChange}
-      onBlur={handleBlur}
+      onBlur={saveAndFinish}
       onKeyDown={handleKeyDown}
       onMouseDown={handleMouseDown}
       style={{
