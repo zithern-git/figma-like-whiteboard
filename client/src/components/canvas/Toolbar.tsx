@@ -64,9 +64,8 @@ export default function Toolbar({ renderer }: ToolbarProps) {
       })
       setTestResult(result)
       setShowResult(true)
-    } catch (error) {
-      console.error('性能测试失败:', error)
-      alert('性能测试失败，请查看控制台')
+    } catch {
+      alert('性能测试失败')
     } finally {
       setIsTesting(false)
     }
@@ -88,9 +87,8 @@ export default function Toolbar({ renderer }: ToolbarProps) {
       })
       setTestResult(result)
       setShowResult(true)
-    } catch (error) {
-      console.error('压力测试失败:', error)
-      alert('压力测试失败，请查看控制台')
+    } catch {
+      alert('压力测试失败')
     } finally {
       setIsTesting(false)
     }
@@ -106,7 +104,7 @@ export default function Toolbar({ renderer }: ToolbarProps) {
   /** 清空画布 */
   const handleClear = () => {
     if (confirm('确定要清空画布吗？此操作不可撤销。')) {
-      useCanvasStore.getState().clearAll()
+      useCanvasStore.getState().clearAllElements()
     }
   }
 

@@ -51,8 +51,8 @@ export interface CanvasElement {
 
 /** 视口状态：描述当前画布的平移和缩放状态 */
 export interface Viewport {
-  x: number // 视口 X 偏移（平移量）
-  y: number // 视口 Y 偏移（平移量）
+  translateX: number // 视口 X 偏移（平移量）
+  translateY: number // 视口 Y 偏移（平移量）
   zoom: number // 视口缩放比例
 }
 

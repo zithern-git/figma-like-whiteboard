@@ -32,8 +32,7 @@ export const useWhiteboardStore = create<WhiteboardState>((set, get) => ({
     try {
       const whiteboard = await whiteboardService.getById(id)
       set({ currentWhiteboard: whiteboard })
-    } catch (error) {
-      console.error('获取白板详情失败:', error)
+    } catch {
       set({ currentWhiteboard: null })
     } finally {
       set({ isLoading: false })

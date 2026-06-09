@@ -1,96 +1,50 @@
 /**
- * Canvas 渲染引擎核心 (CanvasRenderer) 🔥
+ * Canvas 渲染引擎核心 (CanvasRenderer)
  *
- * 白板系统的核心渲染引擎，负责管理三层 Canvas 架构、视口变换、渲染调度和性能优化。
+ * 统一渲染架构：所有绘制操作必须通过 CanvasRenderer 进行，
+ * 任何外部组件不得直接操作 canvas 上下文。
  *
- * 三层渲染架构 🔥：
- * ┌─────────────────────────────────────┐
- * │  临时层 (Temp Layer) - z-index: 3   │  每帧全量重绘，绘制交互中的临时元素
- * │  主层   (Main Layer) - z-index: 2   │  离屏Canvas预渲染 + 脏矩形增量更新
- * │  背景层 (Bg Layer)   - z-index: 1   │  仅在缩放/平移时重绘，绘制网格和底色
- * └─────────────────────────────────────┘
- *
- * 核心技术点：
- * - 视口裁剪：仅渲染当前视口内的元素，包围盒与视口矩形相交检测
- * - requestAnimationFrame 调度：合并同一帧内的多次重绘请求
- * - 坐标转换：屏幕坐标 ↔ 世界坐标（考虑视口平移和缩放）
- *
- * 设计原则：
- * - 背景层 = 低频重绘（缩放/平移），高频重绘代价大
- * - 主层 = 增量重绘（脏矩形），避免全量重绘
- * - 临时层 = 高频重绘（每帧），但仅含少量交互元素
+ * 核心设计原则：
+ * - bgCtx/mainCtx/tempCtx 为私有属性，外部不可访问
+ * - 所有临时绘制内容通过 addTemporaryDraw() 注册到渲染队列
+ * - CanvasRenderer 统一在 rAF 中绘制所有内容
+ * - 主层元素和临时层内容使用完全相同的坐标变换逻辑
  */
 
-import { CanvasElement, Viewport, DirtyRect } from './CanvasElement'
-import { ShapeRenderer } from './ShapeRenderer'
-import { DirtyRectManager } from './DirtyRectManager'
-import { OffscreenCanvasManager } from './OffscreenCanvas'
+import { CanvasElement } from './CanvasElement'
 
-/** 网格间距（像素） */
-const GRID_SPACING = 20
+interface Viewport {
+  translateX: number
+  translateY: number
+  zoom: number
+}
 
-/** 网格线颜色 */
-const GRID_COLOR = '#E5E5E5'
-
-/** 画布背景色 */
-const BACKGROUND_COLOR = '#FFFFFF'
+interface TemporaryDrawItem {
+  id: string
+  render: (ctx: CanvasRenderingContext2D) => void
+  zIndex: number
+}
 
 export class CanvasRenderer {
-  // ========== Canvas 元素引用 ==========
-  private bgCanvas: HTMLCanvasElement
-  private mainCanvas: HTMLCanvasElement
-  private tempCanvas: HTMLCanvasElement
+  private readonly dpr: number = window.devicePixelRatio || 1
+  private readonly bgCanvas: HTMLCanvasElement
+  private readonly mainCanvas: HTMLCanvasElement
+  private readonly tempCanvas: HTMLCanvasElement
+  private readonly bgCtx: CanvasRenderingContext2D
+  private readonly mainCtx: CanvasRenderingContext2D
+  private readonly tempCtx: CanvasRenderingContext2D
 
-  private bgCtx: CanvasRenderingContext2D
-  private mainCtx: CanvasRenderingContext2D
-  private tempCtx: CanvasRenderingContext2D
-
-  // ========== 渲染状态 ==========
-  /** 视口状态（平移 + 缩放） */
-  private viewport: Viewport = { x: 0, y: 0, zoom: 1 }
-
-  /** 所有元素列表 */
+  private viewport: Viewport = { translateX: 0, translateY: 0, zoom: 1 }
   private elements: CanvasElement[] = []
-
-  /** 选中的元素 ID 集合 */
   private selectedIds: Set<string> = new Set()
+  private temporaryDrawQueue: TemporaryDrawItem[] = []
 
-  // ========== 性能优化组件 ==========
-  /** 背景层脏矩形管理器 */
-  private bgDirtyManager = new DirtyRectManager()
+  // 正在编辑的文本元素 ID，渲染时跳过该元素
+  private editingTextId: string | null = null
 
-  /** 主层脏矩形管理器 */
-  private mainDirtyManager = new DirtyRectManager()
+  private animationFrameId: number | null = null
+  private dirtyFlags = { main: true, temp: true, bg: true }
 
-  /** 离屏 Canvas 缓存管理器 */
-  private offscreenManager = new OffscreenCanvasManager()
-
-  // ========== 渲染调度 ==========
-  /** 当前是否已调度了 rAF 回调 */
-  private rafScheduled = false
-
-  /** rAF 回调 ID */
-  private rafId: number | null = null
-
-  /** 需要重绘的层标志 */
-  private needsRedraw = {
-    bg: false,
-    main: false,
-    temp: false,
-  }
-
-  /** ResizeObserver 实例 */
-  private resizeObserver: ResizeObserver | null = null
-
-  /**
-   * 构造函数
-   *
-   * 初始化三个 Canvas 元素的 2D 上下文，并设置 ResizeObserver 响应式尺寸管理。
-   *
-   * @param bgCanvas - 背景层 Canvas 元素
-   * @param mainCanvas - 主层 Canvas 元素
-   * @param tempCanvas - 临时层 Canvas 元素
-   */
   constructor(
     bgCanvas: HTMLCanvasElement,
     mainCanvas: HTMLCanvasElement,
@@ -104,600 +58,341 @@ export class CanvasRenderer {
     this.mainCtx = mainCanvas.getContext('2d')!
     this.tempCtx = tempCanvas.getContext('2d')!
 
-    this.setupResizeObserver()
-    this.scheduleRender('bg')
+    this.resize()
+    window.addEventListener('resize', this.resize)
+    this.startRenderLoop()
   }
 
-  // ======================================================================
-  // 响应式尺寸管理
-  // ======================================================================
+  // ============================================================
+  // 公共API - 外部组件只能调用这些方法
+  // ============================================================
 
   /**
-   * 设置 ResizeObserver 响应式尺寸管理
-   *
-   * 监听容器尺寸变化，自动调整 Canvas 的 width/height 属性以匹配 CSS 尺寸。
-   * Canvas 的渲染尺寸（width/height 属性）必须与 CSS 显示尺寸一致，
-   * 否则会出现模糊或像素错位。
+   * 添加临时绘制内容（用于工具预览、选区边框等）
+   * @param id 唯一标识，用于更新或移除
+   * @param render 绘制函数，接收已应用视口变换的上下文
+   * @param zIndex 绘制顺序，数值越大越靠上
    */
-  private setupResizeObserver(): void {
-    const container = this.bgCanvas.parentElement
-    if (!container) return
-
-    this.resizeObserver = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        const { width, height } = entry.contentRect
-        this.resizeCanvas(width, height)
-      }
-    })
-
-    this.resizeObserver.observe(container)
+  addTemporaryDraw(id: string, render: (ctx: CanvasRenderingContext2D) => void, zIndex = 0) {
+    this.removeTemporaryDraw(id)
+    this.temporaryDrawQueue.push({ id, render, zIndex })
+    this.temporaryDrawQueue.sort((a, b) => a.zIndex - b.zIndex)
+    this.markDirty('temp')
   }
 
   /**
-   * 调整 Canvas 尺寸
-   *
-   * 同步调整三层 Canvas 的渲染尺寸。Canvas 属性重置会清空画布内容，
-   * 因此调整后需要重新渲染所有层。
-   *
-   * @param width - 新宽度
-   * @param height - 新高度
+   * 移除临时绘制内容
    */
-  private resizeCanvas(width: number, height: number): void {
-    const dpr = window.devicePixelRatio || 1
-    const w = Math.floor(width * dpr)
-    const h = Math.floor(height * dpr)
-
-    // 避免不必要的重置
-    if (this.bgCanvas.width === w && this.bgCanvas.height === h) return
-
-    this.bgCanvas.width = w
-    this.bgCanvas.height = h
-    this.mainCanvas.width = w
-    this.mainCanvas.height = h
-    this.tempCanvas.width = w
-    this.tempCanvas.height = h
-
-    // 重置所有上下文的变换矩阵以适配 DPR
-    this.bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    this.mainCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    this.tempCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
-
-    // 尺寸变化后需要全量重绘
-    this.bgDirtyManager.markFullRedraw()
-    this.mainDirtyManager.markFullRedraw()
-    this.scheduleRender('bg')
-    this.scheduleRender('main')
+  removeTemporaryDraw(id: string) {
+    this.temporaryDrawQueue = this.temporaryDrawQueue.filter(item => item.id !== id)
+    this.markDirty('temp')
   }
 
-  // ======================================================================
-  // 视口管理与坐标转换
-  // ======================================================================
-
   /**
-   * 设置视口状态
-   *
-   * 视口变化时背景层需要全量重绘（网格位置变化），
-   * 主层需要全量重绘（元素世界坐标映射变化）。
-   *
-   * @param viewport - 新的视口状态
+   * 清空所有临时绘制内容
    */
-  setViewport(viewport: Partial<Viewport>): void {
-    Object.assign(this.viewport, viewport)
-    this.bgDirtyManager.markFullRedraw()
-    this.mainDirtyManager.markFullRedraw()
-    this.scheduleRender('bg')
-    this.scheduleRender('main')
+  clearAllTemporaryDraw() {
+    this.temporaryDrawQueue = []
+    this.markDirty('temp')
   }
 
   /**
-   * 获取当前视口状态
+   * 坐标转换：屏幕坐标 → 世界坐标
+   */
+  screenToWorld(screenX: number, screenY: number): { x: number; y: number } {
+    return {
+      x: (screenX - this.viewport.translateX) / this.viewport.zoom,
+      y: (screenY - this.viewport.translateY) / this.viewport.zoom
+    }
+  }
+
+  /**
+   * 坐标转换：世界坐标 → 屏幕坐标
+   */
+  worldToScreen(worldX: number, worldY: number): { x: number; y: number } {
+    return {
+      x: worldX * this.viewport.zoom + this.viewport.translateX,
+      y: worldY * this.viewport.zoom + this.viewport.translateY
+    }
+  }
+
+  /**
+   * 设置元素列表
+   */
+  setElements(elements: CanvasElement[]) {
+    this.elements = elements
+    this.markDirty('main')
+  }
+
+  /**
+   * 设置选中元素ID
+   */
+  setSelectedIds(ids: Set<string>) {
+    this.selectedIds = ids
+    this.markDirty('temp')
+  }
+
+  /**
+   * 设置正在编辑的文本元素 ID
+   */
+  setEditingTextId(id: string | null) {
+    this.editingTextId = id
+    this.markDirty('main')
+  }
+
+  /**
+   * 设置视口
+   */
+  setViewport(viewport: Partial<Viewport>) {
+    this.viewport = { ...this.viewport, ...viewport }
+    this.markDirty('all')
+  }
+
+  /**
+   * 获取当前视口
    */
   getViewport(): Viewport {
     return { ...this.viewport }
   }
 
   /**
-   * 屏幕坐标 → 世界坐标 🔥
-   *
-   * 将鼠标事件的屏幕坐标转换为画布世界坐标。
-   * 公式：worldX = (screenX - viewport.x) / zoom
-   *       worldY = (screenY - viewport.y) / zoom
-   *
-   * 原理：Canvas 使用仿射变换矩阵实现视口变换，
-   * 屏幕坐标需要逆变换回世界坐标以匹配元素位置。
-   *
-   * @param screenX - 屏幕 X 坐标
-   * @param screenY - 屏幕 Y 坐标
-   * @returns 世界坐标
+   * 销毁渲染器
    */
-  screenToWorld(screenX: number, screenY: number): { x: number; y: number } {
-    return {
-      x: (screenX - this.viewport.x) / this.viewport.zoom,
-      y: (screenY - this.viewport.y) / this.viewport.zoom,
+  destroy() {
+    if (this.animationFrameId) {
+      cancelAnimationFrame(this.animationFrameId)
     }
+    window.removeEventListener('resize', this.resize)
   }
 
-  /**
-   * 世界坐标 → 屏幕坐标
-   *
-   * 公式：screenX = worldX * zoom + viewport.x
-   *       screenY = worldY * zoom + viewport.y
-   *
-   * @param worldX - 世界 X 坐标
-   * @param worldY - 世界 Y 坐标
-   * @returns 屏幕坐标
-   */
-  worldToScreen(worldX: number, worldY: number): { x: number; y: number } {
-    return {
-      x: worldX * this.viewport.zoom + this.viewport.x,
-      y: worldY * this.viewport.zoom + this.viewport.y,
-    }
+  // ============================================================
+  // 私有方法 - 内部渲染逻辑
+  // ============================================================
+
+  private resize = () => {
+    const container = this.bgCanvas.parentElement!
+    const cssWidth = container.clientWidth
+    const cssHeight = container.clientHeight
+
+    // 设置Canvas实际像素尺寸
+    this.bgCanvas.width = cssWidth * this.dpr
+    this.bgCanvas.height = cssHeight * this.dpr
+    this.mainCanvas.width = cssWidth * this.dpr
+    this.mainCanvas.height = cssHeight * this.dpr
+    this.tempCanvas.width = cssWidth * this.dpr
+    this.tempCanvas.height = cssHeight * this.dpr
+
+    // 设置CSS显示尺寸
+    this.bgCanvas.style.width = `${cssWidth}px`
+    this.bgCanvas.style.height = `${cssHeight}px`
+    this.mainCanvas.style.width = `${cssWidth}px`
+    this.mainCanvas.style.height = `${cssHeight}px`
+    this.tempCanvas.style.width = `${cssWidth}px`
+    this.tempCanvas.style.height = `${cssHeight}px`
+
+    // 应用DPR缩放，所有绘制使用CSS坐标
+    this.bgCtx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0)
+    this.mainCtx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0)
+    this.tempCtx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0)
+
+    this.markDirty('all')
   }
 
-  // ======================================================================
-  // 渲染调度 (requestAnimationFrame)
-  // ======================================================================
+  private startRenderLoop() {
+    const render = () => {
+      if (this.dirtyFlags.bg) {
+        this.renderBackground()
+        this.dirtyFlags.bg = false
+      }
 
-  /**
-   * 调度渲染 🔥
-   *
-   * 使用 requestAnimationFrame 进行渲染调度。
-   * 同一帧内的多次重绘请求合并为一次执行，在 rAF 回调中统一处理。
-   * 这样可以避免短时间内的多次重绘，减少不必要的渲染开销。
-   *
-   * @param layer - 需要重绘的层（'bg' | 'main' | 'temp'）
-   */
-  scheduleRender(layer: 'bg' | 'main' | 'temp'): void {
-    this.needsRedraw[layer] = true
+      if (this.dirtyFlags.main) {
+        this.renderMainLayer()
+        this.dirtyFlags.main = false
+      }
 
-    if (!this.rafScheduled) {
-      this.rafScheduled = true
-      this.rafId = requestAnimationFrame(() => {
-        this.rafId = null
-        this.rafScheduled = false
-        this.performRender()
-      })
+      if (this.dirtyFlags.temp) {
+        this.renderTempLayer()
+        this.dirtyFlags.temp = false
+      }
+
+      this.animationFrameId = requestAnimationFrame(render)
     }
+
+    this.animationFrameId = requestAnimationFrame(render)
   }
 
-  /**
-   * 执行渲染
-   *
-   * 按顺序渲染背景层 → 主层 → 临时层。
-   * 每层独立判断是否需要重绘，避免不必要的渲染。
-   */
-  private performRender(): void {
-    if (this.needsRedraw.bg) {
-      this.renderBackgroundLayer()
-      this.needsRedraw.bg = false
-    }
-    if (this.needsRedraw.main) {
-      this.renderMainLayer()
-      this.needsRedraw.main = false
-    }
-    if (this.needsRedraw.temp) {
-      this.renderTempLayer()
-      this.needsRedraw.temp = false
-    }
-  }
-
-  // ======================================================================
-  // 背景层渲染
-  // ======================================================================
-
-  /**
-   * 渲染背景层 🔥
-   *
-   * 背景层绘制网格背景和画布底色。
-   * 仅在缩放/平移时重绘（bgDirtyManager 标记全量重绘），
-   * 静态时不需要任何重绘，开销极小。
-   */
-  private renderBackgroundLayer(): void {
-    const ctx = this.bgCtx
-    const { width, height } = this.bgCanvas
-
-    ctx.clearRect(0, 0, width, height)
-
-    // 绘制画布底色
-    ctx.fillStyle = BACKGROUND_COLOR
-    ctx.fillRect(0, 0, width, height)
-
-    // 绘制网格背景
-    this.drawGrid(ctx, width, height)
-  }
-
-  /**
-   * 绘制网格背景
-   *
-   * 网格随视口缩放和平移而变化，通过视口变换计算网格线位置。
-   * 网格间距 = GRID_SPACING * zoom，仅在网格间距 >= 4px 时绘制（避免过密）。
-   *
-   * @param ctx - Canvas 2D 上下文
-   * @param width - Canvas 宽度
-   * @param height - Canvas 高度
-   */
-  private drawGrid(ctx: CanvasRenderingContext2D, width: number, height: number): void {
-    const gridSize = GRID_SPACING * this.viewport.zoom
-    if (gridSize < 4) return // 网格太密，跳过绘制
-
-    const offsetX = this.viewport.x % gridSize
-    const offsetY = this.viewport.y % gridSize
-
-    ctx.strokeStyle = GRID_COLOR
-    ctx.lineWidth = 0.5
-
-    ctx.beginPath()
-
-    // 垂直线
-    for (let x = offsetX; x < width; x += gridSize) {
-      ctx.moveTo(x, 0)
-      ctx.lineTo(x, height)
-    }
-
-    // 水平线
-    for (let y = offsetY; y < height; y += gridSize) {
-      ctx.moveTo(0, y)
-      ctx.lineTo(width, y)
-    }
-
-    ctx.stroke()
-  }
-
-  // ======================================================================
-  // 主层渲染（核心）
-  // ======================================================================
-
-  /**
-   * 渲染主层 🔥
-   *
-   * 主层使用离屏 Canvas 预渲染 + 脏矩形增量更新策略：
-   * 1. 获取合并后的脏矩形列表
-   * 2. 对每个脏矩形使用 clip 限定绘制区域
-   * 3. 仅渲染脏矩形内的元素（视口裁剪 + 脏矩形裁剪双重过滤）
-   * 4. 复杂元素优先使用离屏缓存位图
-   */
-  private renderMainLayer(): void {
-    const ctx = this.mainCtx
-    const { width, height } = this.mainCanvas
-    const dirtyRects = this.mainDirtyManager.getMergedRects()
-
-    if (dirtyRects.length === 0) {
-      // 脏矩形过多或全量重绘，清空整个主层
-      ctx.clearRect(0, 0, width, height)
-      this.renderAllElements(ctx, { x: 0, y: 0, width, height })
+  private markDirty(layer: 'bg' | 'main' | 'temp' | 'all') {
+    if (layer === 'all') {
+      this.dirtyFlags.bg = true
+      this.dirtyFlags.main = true
+      this.dirtyFlags.temp = true
     } else {
-      // 增量渲染：仅重绘脏矩形区域
-      for (const rect of dirtyRects) {
-        ctx.save()
-        ctx.beginPath()
-        ctx.rect(rect.x, rect.y, rect.width, rect.height)
-        ctx.clip() // 🔥 使用 clip 限定绘制区域，仅渲染脏矩形内内容
-        ctx.clearRect(rect.x, rect.y, rect.width, rect.height)
-        this.renderAllElements(ctx, rect)
-        ctx.restore()
+      this.dirtyFlags[layer] = true
+    }
+  }
+
+  private renderBackground() {
+    const { width, height } = this.bgCanvas
+    this.bgCtx.clearRect(0, 0, width / this.dpr, height / this.dpr)
+
+    // 绘制网格
+    this.bgCtx.strokeStyle = '#e0e0e0'
+    this.bgCtx.lineWidth = 1
+
+    const gridSize = 20 * this.viewport.zoom
+    const offsetX = this.viewport.translateX % gridSize
+    const offsetY = this.viewport.translateY % gridSize
+
+    for (let x = offsetX; x < width / this.dpr; x += gridSize) {
+      this.bgCtx.beginPath()
+      this.bgCtx.moveTo(x, 0)
+      this.bgCtx.lineTo(x, height / this.dpr)
+      this.bgCtx.stroke()
+    }
+
+    for (let y = offsetY; y < height / this.dpr; y += gridSize) {
+      this.bgCtx.beginPath()
+      this.bgCtx.moveTo(0, y)
+      this.bgCtx.lineTo(width / this.dpr, y)
+      this.bgCtx.stroke()
+    }
+  }
+
+  private renderMainLayer() {
+    const { width, height } = this.mainCanvas
+    this.mainCtx.clearRect(0, 0, width / this.dpr, height / this.dpr)
+
+    this.mainCtx.save()
+    this.mainCtx.translate(this.viewport.translateX, this.viewport.translateY)
+    this.mainCtx.scale(this.viewport.zoom, this.viewport.zoom)
+
+    // 渲染所有元素
+    for (const element of this.elements) {
+      // 关键修复：正在编辑的文本元素不渲染，避免编辑框和原文本重叠
+      if (element.type === 'text' && element.id === this.editingTextId) {
+        continue
+      }
+      this.renderElement(this.mainCtx, element)
+    }
+
+    this.mainCtx.restore()
+  }
+
+  private renderTempLayer() {
+    const { width, height } = this.tempCanvas
+    this.tempCtx.clearRect(0, 0, width / this.dpr, height / this.dpr)
+
+    this.tempCtx.save()
+    this.tempCtx.translate(this.viewport.translateX, this.viewport.translateY)
+    this.tempCtx.scale(this.viewport.zoom, this.viewport.zoom)
+
+    // 渲染所有临时绘制内容
+    for (const item of this.temporaryDrawQueue) {
+      item.render(this.tempCtx)
+    }
+
+    // 渲染选中元素边框
+    for (const element of this.elements) {
+      if (this.selectedIds.has(element.id)) {
+        this.renderSelectionBorder(this.tempCtx, element)
       }
     }
 
-    this.mainDirtyManager.reset()
+    this.tempCtx.restore()
   }
 
-  /**
-   * 渲染所有可见元素
-   *
-   * 遍历元素列表，对每个元素执行：
-   * 1. 视口裁剪：仅渲染当前视口内的元素（包围盒与视口矩形相交检测）
-   * 2. 离屏缓存：复杂元素优先使用离屏 Canvas 缓存位图
-   * 3. 直接渲染：简单元素直接调用 ShapeRenderer
-   *
-   * @param ctx - Canvas 2D 上下文
-   * @param clipRect - 裁剪区域（用于脏矩形增量渲染）
-   */
-  private renderAllElements(
-    ctx: CanvasRenderingContext2D,
-    clipRect: DirtyRect
-  ): void {
-    const dpr = window.devicePixelRatio || 1
-
-    // 将裁剪区域转换为世界坐标（用于视口裁剪）
-    const worldClipTL = this.screenToWorld(clipRect.x / dpr, clipRect.y / dpr)
-    const worldClipBR = this.screenToWorld(
-      (clipRect.x + clipRect.width) / dpr,
-      (clipRect.y + clipRect.height) / dpr
-    )
-    const worldClip = {
-      x: worldClipTL.x,
-      y: worldClipTL.y,
-      width: worldClipBR.x - worldClipTL.x,
-      height: worldClipBR.y - worldClipTL.y,
-    }
-
+  private renderElement(ctx: CanvasRenderingContext2D, element: CanvasElement) {
     ctx.save()
 
-    // 应用视口变换：平移 + 缩放
-    ctx.translate(this.viewport.x, this.viewport.y)
-    ctx.scale(this.viewport.zoom, this.viewport.zoom)
-
-    for (const element of this.elements) {
-      // 🔥 视口裁剪：跳过不在视口内的元素
-      if (!this.isElementInViewport(element, worldClip)) continue
-
-      // 🔥 离屏缓存：复杂元素优先使用缓存渲染
-      if (this.shouldUseOffscreenCache(element)) {
-        this.renderElementFromCache(ctx, element)
-      } else {
-        this.renderElementDirect(ctx, element)
-      }
-    }
-
-    ctx.restore()
-  }
-
-  /**
-   * 判断元素是否在视口内 🔥
-   *
-   * 使用包围盒与视口矩形相交检测（AABB 碰撞检测）：
-   * 两个矩形相交当且仅当它们在所有轴上的投影都有重叠。
-   *
-   * @param element - 待判断的元素
-   * @param viewport - 视口矩形（世界坐标）
-   * @returns 是否在视口内
-   */
-  private isElementInViewport(
-    element: CanvasElement,
-    viewport: { x: number; y: number; width: number; height: number }
-  ): boolean {
-    return !(
-      element.x + element.width < viewport.x ||
-      element.x > viewport.x + viewport.width ||
-      element.y + element.height < viewport.y ||
-      element.y > viewport.y + viewport.height
-    )
-  }
-
-  /**
-   * 判断是否应该使用离屏缓存
-   *
-   * 复杂元素类型（画笔路径、文本、图片）使用离屏缓存，
-   * 简单元素（矩形、圆形、直线）直接渲染。
-   *
-   * @param element - 元素
-   */
-  private shouldUseOffscreenCache(element: CanvasElement): boolean {
-    return element.type === 'pen' || element.type === 'text' || element.type === 'image'
-  }
-
-  /**
-   * 从离屏缓存渲染元素
-   *
-   * 从 OffscreenCanvasManager 获取缓存位图，使用 drawImage 绘制到主层。
-   * 这种方式避免了每帧重新计算画笔路径、渲染字形等昂贵操作。
-   *
-   * @param ctx - Canvas 2D 上下文
-   * @param element - 元素
-   */
-  private renderElementFromCache(
-    ctx: CanvasRenderingContext2D,
-    element: CanvasElement
-  ): void {
-    const cache = this.offscreenManager.getCache(element)
-    if (cache.width > 0 && cache.height > 0) {
-      ctx.save()
-      ctx.globalAlpha = element.opacity
-      ctx.drawImage(cache, element.x, element.y, element.width, element.height)
-      ctx.restore()
-    }
-  }
-
-  /**
-   * 直接渲染元素
-   *
-   * 对于简单元素，直接调用 ShapeRenderer 渲染，无需离屏缓存。
-   *
-   * @param ctx - Canvas 2D 上下文
-   * @param element - 元素
-   */
-  private renderElementDirect(
-    ctx: CanvasRenderingContext2D,
-    element: CanvasElement
-  ): void {
     switch (element.type) {
       case 'rect':
-        ShapeRenderer.renderRect(ctx, element)
+        ctx.strokeStyle = element.stroke || '#000000'
+        ctx.fillStyle = element.fill || 'transparent'
+        ctx.lineWidth = element.strokeWidth || 2
+        ctx.strokeRect(element.x, element.y, element.width, element.height)
+        if (element.fill !== 'transparent') {
+          ctx.fillRect(element.x, element.y, element.width, element.height)
+        }
         break
+
       case 'circle':
-        ShapeRenderer.renderCircle(ctx, element)
+        ctx.strokeStyle = element.stroke || '#000000'
+        ctx.fillStyle = element.fill || 'transparent'
+        ctx.lineWidth = element.strokeWidth || 2
+        ctx.beginPath()
+        ctx.ellipse(
+          element.x + element.width / 2,
+          element.y + element.height / 2,
+          element.width / 2,
+          element.height / 2,
+          0, 0, Math.PI * 2
+        )
+        ctx.stroke()
+        if (element.fill !== 'transparent') {
+          ctx.fill()
+        }
         break
+
       case 'line':
-        ShapeRenderer.renderLine(ctx, element)
+        ctx.strokeStyle = element.stroke || '#000000'
+        ctx.lineWidth = element.strokeWidth || 2
+        ctx.beginPath()
+        if (element.points && element.points.length >= 2) {
+          ctx.moveTo(element.points[0].x, element.points[0].y)
+          ctx.lineTo(element.points[1].x, element.points[1].y)
+        }
+        ctx.stroke()
         break
+
       case 'pen':
-        ShapeRenderer.renderPen(ctx, element)
+        ctx.strokeStyle = element.stroke || '#000000'
+        ctx.lineWidth = element.strokeWidth || 2
+        ctx.lineCap = 'round'
+        ctx.lineJoin = 'round'
+        ctx.beginPath()
+        if (element.points && element.points.length > 0) {
+          ctx.moveTo(element.points[0].x, element.points[0].y)
+          for (let i = 1; i < element.points.length; i++) {
+            ctx.lineTo(element.points[i].x, element.points[i].y)
+          }
+          ctx.stroke()
+        }
         break
+
       case 'text':
-        ShapeRenderer.renderText(ctx, element)
+        ctx.fillStyle = element.fill || '#000000'
+        ctx.font = `${element.fontSize || 16}px ${element.fontFamily || 'Arial'}`
+        ctx.textBaseline = 'top'
+        if (element.text) {
+          ctx.fillText(element.text, element.x, element.y)
+        }
         break
     }
-  }
-
-  // ======================================================================
-  // 临时层渲染
-  // ======================================================================
-
-  /**
-   * 渲染临时层
-   *
-   * 临时层每帧全量重绘，但仅包含少量交互元素：
-   * - 正在拖拽的元素预览
-   * - 选择框（选区边框）
-   * - 多选手柄
-   * - 远程光标
-   *
-   * 由于交互元素数量极少（通常 < 10 个），全量重绘开销可控。
-   */
-  private renderTempLayer(): void {
-    const ctx = this.tempCtx
-    const { width, height } = this.tempCanvas
-
-    ctx.clearRect(0, 0, width, height)
-    ctx.save()
-    ctx.translate(this.viewport.x, this.viewport.y)
-    ctx.scale(this.viewport.zoom, this.viewport.zoom)
-
-    // 绘制选中元素的选区边框
-    this.renderSelectionBorders(ctx)
 
     ctx.restore()
   }
 
-  /**
-   * 绘制选中元素的选区边框
-   *
-   * 为每个选中的元素绘制蓝色虚线边框和控制手柄。
-   *
-   * @param ctx - Canvas 2D 上下文
-   */
-  private renderSelectionBorders(ctx: CanvasRenderingContext2D): void {
-    if (this.selectedIds.size === 0) return
+  private renderSelectionBorder(ctx: CanvasRenderingContext2D, element: CanvasElement) {
+    ctx.save()
+    ctx.strokeStyle = '#1890ff'
+    ctx.lineWidth = 1 / this.viewport.zoom
+    ctx.setLineDash([5 / this.viewport.zoom, 5 / this.viewport.zoom])
 
-    ctx.strokeStyle = '#4A90D9'
-    ctx.lineWidth = 2 / this.viewport.zoom // 线宽不受缩放影响
-    ctx.setLineDash([5, 5])
+    let x, y, w, h
 
-    for (const id of this.selectedIds) {
-      const element = this.elements.find((e) => e.id === id)
-      if (!element) continue
-
-      ctx.strokeRect(element.x - 2, element.y - 2, element.width + 4, element.height + 4)
+    if (element.type === 'line' && element.points && element.points.length >= 2) {
+      x = Math.min(element.points[0].x, element.points[1].x) - 5
+      y = Math.min(element.points[0].y, element.points[1].y) - 5
+      w = Math.abs(element.points[1].x - element.points[0].x) + 10
+      h = Math.abs(element.points[1].y - element.points[0].y) + 10
+    } else {
+      x = element.x - 5
+      y = element.y - 5
+      w = element.width + 10
+      h = element.height + 10
     }
 
-    ctx.setLineDash([])
-  }
-
-  // ======================================================================
-  // 公共接口
-  // ======================================================================
-
-  /**
-   * 设置元素列表
-   *
-   * 更新元素列表时标记主层需要全量重绘。
-   *
-   * @param elements - 新元素列表
-   */
-  setElements(elements: CanvasElement[]): void {
-    this.elements = elements
-    this.mainDirtyManager.markFullRedraw()
-    this.scheduleRender('main')
-  }
-
-  /**
-   * 添加元素
-   *
-   * 仅标记新元素包围盒为脏矩形，避免全量重绘。
-   *
-   * @param element - 新元素
-   */
-  addElement(element: CanvasElement): void {
-    this.elements.push(element)
-    this.markElementDirty(element)
-    this.scheduleRender('main')
-  }
-
-  /**
-   * 更新元素
-   *
-   * 标记旧包围盒和新包围盒为脏矩形，确保旧位置被清除。
-   * 同时使离屏缓存失效。
-   *
-   * @param id - 元素 ID
-   * @param updates - 需要更新的属性
-   */
-  updateElement(id: string, updates: Partial<CanvasElement>): void {
-    const index = this.elements.findIndex((e) => e.id === id)
-    if (index === -1) return
-
-    const oldElement = this.elements[index]
-    this.markElementDirty(oldElement)
-
-    this.elements[index] = { ...oldElement, ...updates, updatedAt: Date.now() }
-
-    this.markElementDirty(this.elements[index])
-    this.offscreenManager.invalidateCache(id)
-    this.scheduleRender('main')
-  }
-
-  /**
-   * 删除元素
-   *
-   * 标记被删除元素的包围盒为脏矩形。
-   *
-   * @param id - 元素 ID
-   */
-  removeElement(id: string): void {
-    const element = this.elements.find((e) => e.id === id)
-    if (element) {
-      this.markElementDirty(element)
-    }
-    this.elements = this.elements.filter((e) => e.id !== id)
-    this.offscreenManager.invalidateCache(id)
-    this.scheduleRender('main')
-  }
-
-  /**
-   * 标记元素包围盒为脏矩形
-   *
-   * 将元素的世界坐标包围盒转换为屏幕坐标后标记为脏矩形。
-   *
-   * @param element - 发生变化的元素
-   */
-  private markElementDirty(element: CanvasElement): void {
-    const screenPos = this.worldToScreen(element.x, element.y)
-    const screenW = element.width * this.viewport.zoom
-    const screenH = element.height * this.viewport.zoom
-
-    this.mainDirtyManager.markDirty({
-      x: screenPos.x,
-      y: screenPos.y,
-      width: screenW + 10, // 略大于元素包围盒，包含描边
-      height: screenH + 10,
-    })
-  }
-
-  /**
-   * 设置选中元素
-   *
-   * 选区变化时，临时层需要重绘（更新选区边框）。
-   *
-   * @param ids - 选中的元素 ID 集合
-   */
-  setSelectedIds(ids: Set<string>): void {
-    this.selectedIds = ids
-    this.scheduleRender('temp')
-  }
-
-  /**
-   * 获取离屏缓存管理器
-   *
-   * 供外部使用（如图片预加载）。
-   */
-  getOffscreenManager(): OffscreenCanvasManager {
-    return this.offscreenManager
-  }
-
-  /**
-   * 清理资源
-   *
-   * 取消 rAF 回调，断开 ResizeObserver。
-   */
-  destroy(): void {
-    if (this.rafId !== null) {
-      cancelAnimationFrame(this.rafId)
-      this.rafId = null
-    }
-    if (this.resizeObserver) {
-      this.resizeObserver.disconnect()
-      this.resizeObserver = null
-    }
-    this.offscreenManager.invalidateAll()
+    ctx.strokeRect(x, y, w, h)
+    ctx.restore()
   }
 }

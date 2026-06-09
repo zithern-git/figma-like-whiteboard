@@ -19,7 +19,7 @@
 import { useEffect, useCallback } from 'react'
 import { useCanvasStore } from '@/stores/canvasStore'
 import { ToolType } from '@/canvas/CanvasElement'
-import { CanvasRenderer } from '@/canvas'
+import { CanvasRenderer } from '@/canvas/CanvasRenderer'
 
 export function useKeyboardShortcuts(renderer: CanvasRenderer | null) {
   const store = useCanvasStore()
@@ -101,7 +101,7 @@ export function useKeyboardShortcuts(renderer: CanvasRenderer | null) {
           case 'delete': {
             // Ctrl+Shift+Delete：清空画布
             e.preventDefault()
-            store.clearAll()
+            store.clearAllElements()
             break
           }
         }
@@ -118,7 +118,7 @@ export function useKeyboardShortcuts(renderer: CanvasRenderer | null) {
         // 取消选择或切换到选择工具
         const state = useCanvasStore.getState()
         if (state.selectedIds.size > 0) {
-          store.clearSelection()
+          store.deselectAll()
         } else {
           store.setTool('select')
         }

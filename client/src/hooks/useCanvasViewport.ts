@@ -10,8 +10,8 @@
  *
  * 缩放原理：
  * 以鼠标位置为中心缩放意味着缩放后鼠标指向的世界坐标点保持不变。
- * 公式：newViewport.x = mouseX - (mouseX - oldViewport.x) * newZoom / oldZoom
- *       newViewport.y = mouseY - (mouseY - oldViewport.y) * newZoom / oldZoom
+ * 公式：newViewport.translateX = mouseX - (mouseX - oldViewport.translateX) * newZoom / oldZoom
+ *       newViewport.translateY = mouseY - (mouseY - oldViewport.translateY) * newZoom / oldZoom
  */
 
 import { useCallback, useRef, useEffect } from 'react'
@@ -59,10 +59,10 @@ export function useCanvasViewport(
       const newZoom = clampZoom(viewport.zoom * (1 + delta))
 
       // 以鼠标位置为中心缩放：调整视口偏移使鼠标指向的世界坐标不变
-      const newX = mouseX - (mouseX - viewport.x) * (newZoom / viewport.zoom)
-      const newY = mouseY - (mouseY - viewport.y) * (newZoom / viewport.zoom)
+      const newTranslateX = mouseX - (mouseX - viewport.translateX) * (newZoom / viewport.zoom)
+      const newTranslateY = mouseY - (mouseY - viewport.translateY) * (newZoom / viewport.zoom)
 
-      renderer.setViewport({ x: newX, y: newY, zoom: newZoom })
+      renderer.setViewport({ translateX: newTranslateX, translateY: newTranslateY, zoom: newZoom })
       onZoomChange?.(newZoom)
     },
     [renderer, clampZoom, onZoomChange]
@@ -137,7 +137,7 @@ export function useCanvasViewport(
    */
   const resetViewport = useCallback(() => {
     if (!renderer) return
-    renderer.setViewport({ x: 0, y: 0, zoom: 1 })
+    renderer.setViewport({ translateX: 0, translateY: 0, zoom: 1 })
     onZoomChange?.(1)
   }, [renderer, onZoomChange])
 

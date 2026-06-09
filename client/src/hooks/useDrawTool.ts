@@ -1,294 +1,490 @@
 /**
- * 绘图工具 Hook (useDrawTool) 🔥
+ * 绘图工具 Hook (useDrawTool)
  *
- * 管理绘图工具的交互流程：鼠标按下 → 拖拽 → 释放。
- * 支持所有绘图工具类型（画笔、直线、矩形、圆形、文本、图片）。
+ * 只处理鼠标事件和元素创建，不直接操作 Canvas 上下文。
+ * 所有预览绘制通过 CanvasRenderer.addTemporaryDraw() 注册到统一渲染队列。
  *
- * 交互流程：
- * 1. onMouseDown：创建临时元素，记录起始点
- * 2. onMouseMove：更新临时元素（实时预览在临时层）
- * 3. onMouseUp：确认元素，提交到主层（通过 canvasStore）
- *
- * 各工具拖拽逻辑：
- * - 画笔（pen）：记录移动轨迹点序列，释放时 Catmull-Rom 平滑
- * - 直线（line）：从起点到当前鼠标位置绘制直线
- * - 矩形（rect）：从起点到当前鼠标位置确定包围盒
- * - 圆形（circle）：从起点到当前鼠标位置确定半径（Shift 锁正圆）
- * - 文本（text）：点击位置创建文本输入框
- * - 橡皮擦（eraser）：检测与元素包围盒相交，标记删除
+ * 文本编辑采用 Figma 标准的交互逻辑：
+ * - 统一的生命周期管理，cleanupTextEditor 作为唯一退出入口
+ * - activeInputRef 确保任何时候最多只有一个编辑框
+ * - 全局 click/keydown 监听实现点击外部自动保存和 Esc 取消
  */
 
-import { useCallback, useRef } from 'react'
-import { CanvasRenderer, catmullRomSmooth } from '@/canvas'
+import { useCallback, useRef, useState, useEffect } from 'react'
+import { CanvasRenderer } from '@/canvas/CanvasRenderer'
 import { CanvasElement, Point, ToolType } from '@/canvas/CanvasElement'
 import { useCanvasStore } from '@/stores/canvasStore'
 
-export function useDrawTool(renderer: CanvasRenderer | null) {
+const ERASER_RADIUS = 16
+const MIN_SIZE = 2
+
+/** 临时绘制项的唯一 ID */
+const TEMP_DRAW_ID = 'draw-tool-preview'
+
+/**
+ * 编辑框上下文信息
+ */
+interface EditingContext {
+  element: CanvasElement | null
+  elementIndex: number
+  originalText: string
+  worldX: number
+  worldY: number
+  screenX: number
+  screenY: number
+}
+
+export function useDrawTool(_renderer: CanvasRenderer | null) {
   const store = useCanvasStore()
 
-  /** 是否正在绘制 */
   const isDrawing = useRef(false)
-  /** 起始点（世界坐标） */
-  const startPoint = useRef<Point>({ x: 0, y: 0 })
-  /** 当前点（世界坐标） */
-  const currentPoint = useRef<Point>({ x: 0, y: 0 })
-  /** 画笔轨迹点序列 */
-  const penPoints = useRef<Point[]>([])
-  /** 是否按下了 Shift 键 */
-  const isShiftPressed = useRef(false)
+  const activeTool = useRef<ToolType>('select')
+  const startPt = useRef<Point>({ x: 0, y: 0 })
+  const curPt = useRef<Point>({ x: 0, y: 0 })
+  const penPts = useRef<Point[]>([])
 
-  /**
-   * 处理鼠标按下事件
-   *
-   * 根据当前活动工具执行不同的初始化逻辑。
-   *
-   * @param e - 鼠标事件
-   */
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!renderer) return
+  /** 存储从事件中获取的 renderer 引用 */
+  const rendererRef = useRef<CanvasRenderer | null>(null)
 
-      const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
-      const screenX = e.clientX - rect.left
-      const screenY = e.clientY - rect.top
-      const worldPos = renderer.screenToWorld(screenX, screenY)
+  // ========== 文本编辑状态管理（React state，不是全局变量） ==========
+  const [isEditingText, setIsEditingText] = useState(false)
+  const activeInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const editingContextRef = useRef<EditingContext | null>(null)
 
-      const activeTool = useCanvasStore.getState().activeTool
+  // ========== 统一的编辑框清理函数 ==========
+  const cleanupTextEditor = useCallback(
+    (saveChanges: boolean = true) => {
+      if (activeInputRef.current) {
+        const input = activeInputRef.current
+        const context = editingContextRef.current
 
-      // 选择工具交给 useElementSelection 处理
-      if (activeTool === 'select' || activeTool === 'eraser') return
+        if (saveChanges && context) {
+          const newText = input.value.trim()
+          if (newText) {
+            if (context.element) {
+              // 编辑现有文本
+              store.updateElement(context.element.id, { text: newText })
+            } else {
+              // 创建新文本
+              const el = store.createElement('text', {
+                x: context.worldX,
+                y: context.worldY,
+                text: newText,
+                width: 200,
+                height: (store.fontSize || 16) * 2,
+                fontSize: store.fontSize || 16,
+              })
+              store.addElement(el)
+            }
+          }
+        }
 
-      isDrawing.current = true
-      startPoint.current = { ...worldPos }
-      currentPoint.current = { ...worldPos }
-
-      if (activeTool === 'pen') {
-        penPoints.current = [{ ...worldPos }]
-      }
-
-      // 文本工具：点击位置创建文本元素
-      if (activeTool === 'text') {
-        const newElement = store.createElement('text', {
-          x: worldPos.x,
-          y: worldPos.y,
-          width: 200,
-          height: store.fontSize * 2,
-          text: '双击编辑文本',
-          fontSize: store.fontSize,
-        })
-        store.addElement(newElement)
-        isDrawing.current = false
+        document.body.removeChild(input)
+        activeInputRef.current = null
+        editingContextRef.current = null
+        setIsEditingText(false)
       }
     },
-    [renderer, store]
+    [store]
   )
 
-  /**
-   * 处理鼠标移动事件
-   *
-   * 拖拽过程中实时更新临时层预览。
-   *
-   * @param e - 鼠标事件
-   */
-  const handleMouseMove = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!renderer || !isDrawing.current) return
+  // ========== 全局监听：点击编辑框外部自动保存 ==========
+  useEffect(() => {
+    const handleGlobalMouseDown = (e: MouseEvent) => {
+      if (isEditingText && activeInputRef.current) {
+        if (!activeInputRef.current.contains(e.target as Node)) {
+          cleanupTextEditor(true)
+        }
+      }
+    }
 
-      const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
-      const screenX = e.clientX - rect.left
-      const screenY = e.clientY - rect.top
-      const worldPos = renderer.screenToWorld(screenX, screenY)
+    window.addEventListener('mousedown', handleGlobalMouseDown, true)
+    return () => window.removeEventListener('mousedown', handleGlobalMouseDown, true)
+  }, [isEditingText, cleanupTextEditor])
 
-      currentPoint.current = { ...worldPos }
+  // ========== 全局监听：Esc 取消编辑 ==========
+  useEffect(() => {
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (isEditingText) {
+        e.stopPropagation()
+        if (e.key === 'Escape') {
+          cleanupTextEditor(false)
+        }
+      }
+    }
 
-      const activeTool = useCanvasStore.getState().activeTool
+    window.addEventListener('keydown', handleGlobalKeyDown, true)
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown, true)
+  }, [isEditingText, cleanupTextEditor])
 
-      if (activeTool === 'pen') {
-        // 画笔：记录轨迹点
-        penPoints.current.push({ ...worldPos })
+  // ========== 统一创建文本编辑框 ==========
+  const createTextEditor = useCallback(
+    (
+      screenX: number,
+      screenY: number,
+      worldX: number,
+      worldY: number,
+      initialText: string = '',
+      existingElement: CanvasElement | null = null,
+      elementIndex: number = -1
+    ) => {
+      // 如果已经有编辑框，先清理
+      cleanupTextEditor(false)
+
+      setIsEditingText(true)
+
+      editingContextRef.current = {
+        element: existingElement,
+        elementIndex,
+        originalText: initialText,
+        worldX,
+        worldY,
+        screenX,
+        screenY,
       }
 
-      // 触发临时层重绘（显示拖拽预览）
-      renderer.scheduleRender('temp')
+      const input = document.createElement('textarea')
+      activeInputRef.current = input
+
+      // Figma 风格的编辑框样式
+      input.style.position = 'absolute'
+      input.style.left = `${screenX}px`
+      input.style.top = `${screenY}px`
+      input.style.fontSize = existingElement?.fontSize ? `${existingElement.fontSize}px` : '16px'
+      input.style.fontFamily = existingElement?.fontFamily || 'Arial, sans-serif'
+      input.style.color = existingElement?.fill || '#000000'
+      input.style.border = '1px solid #1890ff'
+      input.style.boxShadow = '0 2px 8px rgba(0, 0, 0, 0.15)'
+      input.style.outline = 'none'
+      input.style.background = 'white'
+      input.style.padding = '4px 6px'
+      input.style.zIndex = '9999'
+      input.style.resize = 'none'
+      input.style.overflow = 'hidden'
+      input.style.minWidth = '50px'
+      input.style.minHeight = '24px'
+      input.style.lineHeight = '1.2'
+      input.style.whiteSpace = 'pre'
+      input.style.wordBreak = 'keep-all'
+
+      input.value = initialText
+      input.placeholder = ''
+
+      // 自动调整输入框大小
+      const autoResize = () => {
+        input.style.height = 'auto'
+        input.style.height = `${input.scrollHeight}px`
+        input.style.width = 'auto'
+        input.style.width = `${Math.max(input.scrollWidth, 50)}px`
+      }
+
+      input.addEventListener('input', autoResize)
+
+      // 输入框内部事件全部阻止冒泡
+      input.addEventListener('mousedown', (e) => {
+        e.stopPropagation()
+        e.preventDefault()
+      })
+      input.addEventListener('mouseup', (e) => {
+        e.stopPropagation()
+      })
+      input.addEventListener('click', (e) => {
+        e.stopPropagation()
+      })
+      input.addEventListener('dblclick', (e) => {
+        e.stopPropagation()
+      })
+
+      // Enter 保存，Shift+Enter 换行
+      input.addEventListener('keydown', (e) => {
+        e.stopPropagation()
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault()
+          cleanupTextEditor(true)
+        }
+      })
+
+      document.body.appendChild(input)
+      input.focus()
+      input.select()
+      autoResize()
     },
-    [renderer]
+    [cleanupTextEditor]
   )
 
-  /**
-   * 处理鼠标释放事件
-   *
-   * 结束绘制，计算最终元素数据并提交到画布。
-   *
-   * @param e - 鼠标事件
-   */
-  const handleMouseUp = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!renderer || !isDrawing.current) return
-      isDrawing.current = false
+  // ========== 双击编辑文本的入口方法（供 WhiteboardPage 调用） ==========
+  const handleDoubleClickText = useCallback(
+    (
+      screenX: number,
+      screenY: number,
+      worldX: number,
+      worldY: number,
+      element: CanvasElement,
+      elementIndex: number
+    ) => {
+      if (isEditingText) {
+        cleanupTextEditor(false)
+      }
+      createTextEditor(screenX, screenY, worldX, worldY, element.text || '', element, elementIndex)
+    },
+    [isEditingText, cleanupTextEditor, createTextEditor]
+  )
 
-      const activeTool = useCanvasStore.getState().activeTool
-      const start = startPoint.current
-      const current = currentPoint.current
+  // --------------- 生成预览绘制函数 ---------------
 
-      if (activeTool === 'select' || activeTool === 'text') return
+  const buildPreviewRender = useCallback((): ((ctx: CanvasRenderingContext2D) => void) => {
+    const s = useCanvasStore.getState()
+    const tool = activeTool.current
+    const p0 = startPt.current
+    const p1 = curPt.current
+    const vp = rendererRef.current?.getViewport() ?? { translateX: 0, translateY: 0, zoom: 1 }
 
-      let newElement: CanvasElement | null = null
+    return (ctx: CanvasRenderingContext2D) => {
+      ctx.lineCap = 'round'
+      ctx.lineJoin = 'round'
 
-      switch (activeTool) {
+      switch (tool) {
         case 'pen': {
-          // 画笔：使用 Catmull-Rom 平滑后的点序列
-          if (penPoints.current.length < 2) break
-          const smoothedPoints = catmullRomSmooth(penPoints.current)
-          const bounds = calculateBounds(smoothedPoints)
-          newElement = store.createElement('pen', {
-            x: bounds.x,
-            y: bounds.y,
-            width: bounds.width,
-            height: bounds.height,
-            points: smoothedPoints,
-            fill: 'transparent',
-          })
+          const pts = penPts.current
+          if (pts.length < 2) return
+          ctx.strokeStyle = s.strokeColor
+          ctx.lineWidth = s.strokeWidth
+          ctx.beginPath()
+          ctx.moveTo(pts[0].x, pts[0].y)
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
+          ctx.stroke()
           break
         }
         case 'line': {
-          const bounds = calculateBounds([start, current])
-          const padding = 4
-          newElement = store.createElement('line', {
-            x: bounds.x - padding,
-            y: bounds.y - padding,
-            width: Math.max(bounds.width + padding * 2, 1),
-            height: Math.max(bounds.height + padding * 2, 1),
-            points: [{ x: start.x, y: start.y }, { x: current.x, y: current.y }],
+          ctx.strokeStyle = s.strokeColor
+          ctx.lineWidth = s.strokeWidth
+          ctx.beginPath()
+          ctx.moveTo(p0.x, p0.y)
+          ctx.lineTo(p1.x, p1.y)
+          ctx.stroke()
+          break
+        }
+        case 'rect': {
+          const rw = Math.abs(p1.x - p0.x)
+          const rh = Math.abs(p1.y - p0.y)
+          const rx = Math.min(p0.x, p1.x)
+          const ry = Math.min(p0.y, p1.y)
+          ctx.fillStyle = s.fillColor
+          ctx.strokeStyle = s.strokeColor
+          ctx.lineWidth = s.strokeWidth
+          ctx.beginPath()
+          ctx.rect(rx, ry, rw, rh)
+          ctx.fill()
+          ctx.stroke()
+          break
+        }
+        case 'circle': {
+          const cx = p0.x
+          const cy = p0.y
+          const rx = Math.abs(p1.x - p0.x)
+          const ry = Math.abs(p1.y - p0.y)
+          ctx.fillStyle = s.fillColor
+          ctx.strokeStyle = s.strokeColor
+          ctx.lineWidth = s.strokeWidth
+          ctx.beginPath()
+          ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2)
+          ctx.closePath()
+          ctx.fill()
+          ctx.stroke()
+          break
+        }
+        case 'eraser': {
+          if (!isDrawing.current) return
+          const er = ERASER_RADIUS / vp.zoom
+          ctx.strokeStyle = '#999'
+          ctx.lineWidth = 1.5 / vp.zoom
+          ctx.setLineDash([4, 4])
+          ctx.beginPath()
+          ctx.arc(p1.x, p1.y, er, 0, Math.PI * 2)
+          ctx.stroke()
+          ctx.setLineDash([])
+          break
+        }
+      }
+    }
+  }, [])
+
+  // --------------- 鼠标事件 ---------------
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      // 如果正在编辑文本，先保存再处理新操作
+      if (isEditingText) {
+        cleanupTextEditor(true)
+        return
+      }
+
+      const renderer = (e as any)._getRenderer?.()
+      if (!renderer) return
+      rendererRef.current = renderer
+
+      const rect = e.currentTarget.getBoundingClientRect()
+      const sx = e.clientX - rect.left
+      const sy = e.clientY - rect.top
+      const { x, y } = renderer.screenToWorld(sx, sy)
+
+      const tool = useCanvasStore.getState().activeTool
+      activeTool.current = tool
+
+      if (tool === 'select') return
+
+      if (tool === 'eraser') {
+        isDrawing.current = true
+        startPt.current = { x, y }
+        curPt.current = { x, y }
+        eraseAt(x, y, renderer.getViewport().zoom)
+        renderer.addTemporaryDraw(TEMP_DRAW_ID, buildPreviewRender(), 10)
+        return
+      }
+
+      if (tool === 'text') {
+        // 使用统一编辑器创建新文本
+        createTextEditor(e.clientX, e.clientY, x, y)
+        return
+      }
+
+      isDrawing.current = true
+      startPt.current = { x, y }
+      curPt.current = { x, y }
+      if (tool === 'pen') penPts.current = [{ x, y }]
+      renderer.addTemporaryDraw(TEMP_DRAW_ID, buildPreviewRender(), 10)
+    },
+    [store, buildPreviewRender, isEditingText, cleanupTextEditor, createTextEditor]
+  )
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!isDrawing.current || isEditingText) return
+
+      const renderer = (e as any)._getRenderer?.()
+      if (!renderer) return
+      rendererRef.current = renderer
+
+      const rect = e.currentTarget.getBoundingClientRect()
+      const sx = e.clientX - rect.left
+      const sy = e.clientY - rect.top
+      const { x, y } = renderer.screenToWorld(sx, sy)
+
+      curPt.current = { x, y }
+      if (activeTool.current === 'pen') penPts.current.push({ x, y })
+      if (activeTool.current === 'eraser') eraseAt(x, y, renderer.getViewport().zoom)
+      renderer.addTemporaryDraw(TEMP_DRAW_ID, buildPreviewRender(), 10)
+    },
+    [buildPreviewRender, isEditingText]
+  )
+
+  const handleMouseUp = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!isDrawing.current || isEditingText) return
+      isDrawing.current = false
+
+      const renderer = rendererRef.current
+      if (renderer) {
+        renderer.removeTemporaryDraw(TEMP_DRAW_ID)
+      }
+
+      const tool = activeTool.current
+      const p0 = startPt.current
+      const p1 = curPt.current
+
+      if (tool === 'select' || tool === 'eraser' || tool === 'text') return
+
+      let el: CanvasElement | null = null
+      switch (tool) {
+        case 'pen': {
+          if (penPts.current.length < MIN_SIZE) break
+          const b = calcBounds(penPts.current)
+          el = store.createElement('pen', {
+            x: b.x, y: b.y,
+            width: Math.max(b.width, 1), height: Math.max(b.height, 1),
+            points: [...penPts.current], fill: 'transparent',
+          })
+          penPts.current = []
+          break
+        }
+        case 'line': {
+          const b = calcBounds([p0, p1])
+          const pd = store.strokeWidth
+          el = store.createElement('line', {
+            x: b.x - pd, y: b.y - pd,
+            width: Math.max(b.width + pd * 2, MIN_SIZE),
+            height: Math.max(b.height + pd * 2, MIN_SIZE),
+            points: [{ x: p0.x, y: p0.y }, { x: p1.x, y: p1.y }],
             fill: 'transparent',
           })
           break
         }
         case 'rect': {
-          const bounds = calculateBounds([start, current])
-          const padding = store.strokeWidth
-          newElement = store.createElement('rect', {
-            x: bounds.x - padding,
-            y: bounds.y - padding,
-            width: Math.max(bounds.width + padding * 2, 1),
-            height: Math.max(bounds.height + padding * 2, 1),
+          const rx = Math.min(p0.x, p1.x)
+          const ry = Math.min(p0.y, p1.y)
+          const rw = Math.abs(p1.x - p0.x)
+          const rh = e.shiftKey ? rw : Math.abs(p1.y - p0.y)
+          if (rw < MIN_SIZE && rh < MIN_SIZE) break
+          el = store.createElement('rect', {
+            x: rx, y: ry, width: Math.max(rw, MIN_SIZE), height: Math.max(rh, MIN_SIZE),
           })
           break
         }
         case 'circle': {
-          const radiusX = Math.abs(current.x - start.x)
-          const radiusY = isShiftPressed.current
-            ? radiusX // Shift 锁正圆
-            : Math.abs(current.y - start.y)
-          const padding = store.strokeWidth
-          newElement = store.createElement('circle', {
-            x: start.x - radiusX - padding,
-            y: start.y - radiusY - padding,
-            width: (radiusX + padding) * 2,
-            height: (radiusY + padding) * 2,
+          const rx = Math.abs(p1.x - p0.x)
+          const ry = e.shiftKey ? rx : Math.abs(p1.y - p0.y)
+          if (rx < MIN_SIZE && ry < MIN_SIZE) break
+          el = store.createElement('circle', {
+            x: p0.x - rx, y: p0.y - ry, width: rx * 2, height: ry * 2,
           })
           break
         }
       }
-
-      if (newElement) {
-        store.addElement(newElement)
-      }
-
-      penPoints.current = []
+      if (el) store.addElement(el)
     },
-    [renderer, store]
+    [store, isEditingText]
   )
 
-  /**
-   * 处理橡皮擦交互
-   *
-   * 检测橡皮擦轨迹与元素包围盒是否相交，命中则删除元素。
-   *
-   * @param e - 鼠标事件
-   */
-  const handleEraser = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!renderer) return
-      const activeTool = useCanvasStore.getState().activeTool
-      if (activeTool !== 'eraser') return
+  // --------------- 橡皮擦 ---------------
 
-      const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
-      const screenX = e.clientX - rect.left
-      const screenY = e.clientY - rect.top
-      const worldPos = renderer.screenToWorld(screenX, screenY)
-
+  const eraseAt = useCallback(
+    (wx: number, wy: number, zoom: number) => {
       const state = useCanvasStore.getState()
-      const eraserRadius = 20 / state.viewport.zoom // 橡皮擦半径（世界坐标）
-
-      // 碰撞检测：检查橡皮擦范围与所有元素包围盒
-      for (const element of state.elements) {
-        if (isRectIntersectingCircle(
-          element.x, element.y, element.width, element.height,
-          worldPos.x, worldPos.y, eraserRadius
-        )) {
-          store.deleteElement(element.id)
-          break // 每次只删除一个元素
+      const radius = ERASER_RADIUS / zoom
+      for (let i = state.elements.length - 1; i >= 0; i--) {
+        const el = state.elements[i]
+        if (rectCircle(el.x, el.y, el.width, el.height, wx, wy, radius)) {
+          store.deleteElement(el.id)
+          break
         }
       }
     },
-    [renderer, store]
+    [store]
   )
 
   return {
     handleMouseDown,
     handleMouseMove,
     handleMouseUp,
-    handleEraser,
     isDrawing,
+    isEditingText,
+    handleEraser: handleMouseDown,
+    handleDoubleClickText,
   }
 }
 
-/**
- * 计算点序列的包围盒
- *
- * @param points - 点序列
- * @returns 包围盒 { x, y, width, height }
- */
-function calculateBounds(points: Point[]): { x: number; y: number; width: number; height: number } {
-  if (points.length === 0) return { x: 0, y: 0, width: 0, height: 0 }
-
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-
-  for (const p of points) {
-    minX = Math.min(minX, p.x)
-    minY = Math.min(minY, p.y)
-    maxX = Math.max(maxX, p.x)
-    maxY = Math.max(maxY, p.y)
+function calcBounds(pts: Point[]) {
+  if (!pts.length) return { x: 0, y: 0, width: 0, height: 0 }
+  let mx = Infinity, my = Infinity, Mx = -Infinity, My = -Infinity
+  for (const p of pts) {
+    if (p.x < mx) mx = p.x; if (p.y < my) my = p.y
+    if (p.x > Mx) Mx = p.x; if (p.y > My) My = p.y
   }
-
-  return {
-    x: minX,
-    y: minY,
-    width: Math.max(maxX - minX, 1),
-    height: Math.max(maxY - minY, 1),
-  }
+  return { x: mx, y: my, width: Math.max(Mx - mx, 1), height: Math.max(My - my, 1) }
 }
 
-/**
- * 矩形与圆形相交检测
- *
- * 用于橡皮擦碰撞检测，判断橡皮擦圆形范围是否与元素包围盒相交。
- *
- * @param rx, ry, rw, rh - 矩形参数
- * @param cx, cy, cr - 圆形参数
- * @returns 是否相交
- */
-function isRectIntersectingCircle(
-  rx: number, ry: number, rw: number, rh: number,
-  cx: number, cy: number, cr: number
-): boolean {
-  // 找到矩形上离圆心最近的点
-  const closestX = Math.max(rx, Math.min(cx, rx + rw))
-  const closestY = Math.max(ry, Math.min(cy, ry + rh))
-
-  // 计算最近点与圆心的距离
-  const dx = cx - closestX
-  const dy = cy - closestY
-
+function rectCircle(rx: number, ry: number, rw: number, rh: number, cx: number, cy: number, cr: number) {
+  const cX = Math.max(rx, Math.min(cx, rx + rw)), cY = Math.max(ry, Math.min(cy, ry + rh))
+  const dx = cx - cX, dy = cy - cY
   return dx * dx + dy * dy <= cr * cr
 }

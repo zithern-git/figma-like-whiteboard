@@ -19,6 +19,7 @@ import { useAuthStore } from '@/stores/authStore'
 import { useWhiteboardStore } from '@/stores/whiteboardStore'
 import Toolbar from '@/components/canvas/Toolbar'
 import PropertiesPanel from '@/components/canvas/PropertiesPanel'
+import { TextEditor } from '@/components/canvas/TextEditor'
 
 export default function WhiteboardPage() {
   const { id } = useParams<{ id: string }>()
@@ -30,6 +31,16 @@ export default function WhiteboardPage() {
   const [renderer, setRenderer] = useState<CanvasRenderer | null>(null)
   const [zoom, setZoom] = useState(1)
   const [isLoading, setIsLoading] = useState(true)
+
+  // 文本编辑状态
+  const [editingTextId, setEditingTextId] = useState<string | null>(null)
+
+  // 同步 editingTextId 到 CanvasRenderer，使其跳过渲染正在编辑的文本
+  useEffect(() => {
+    if (renderer) {
+      renderer.setEditingTextId(editingTextId)
+    }
+  }, [renderer, editingTextId])
 
   // 初始化 CanvasRenderer
   const handleRendererReady = useCallback((r: CanvasRenderer) => {
@@ -62,6 +73,12 @@ export default function WhiteboardPage() {
   // 统一的鼠标事件处理
   const onMouseDown = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
+      // 如果正在编辑文本，先结束编辑
+      if (editingTextId) {
+        setEditingTextId(null)
+        return
+      }
+
       const activeTool = useCanvasStore.getState().activeTool
 
       if (activeTool === 'select') {
@@ -73,7 +90,7 @@ export default function WhiteboardPage() {
         handleMouseDown(e)
       }
     },
-    [handleSelect, handleTransformStart, handleMouseDown, handleEraser]
+    [handleSelect, handleTransformStart, handleMouseDown, handleEraser, editingTextId]
   )
 
   const onMouseMove = useCallback(
@@ -100,6 +117,38 @@ export default function WhiteboardPage() {
       }
     },
     [handleTransformEnd, handleMouseUp]
+  )
+
+  // 双击事件：编辑文本
+  const onDoubleClick = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      // 如果已经在编辑某个文本，不创建新的编辑框
+      if (editingTextId) {
+        return
+      }
+
+      const r = renderer
+      if (!r) return
+
+      const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
+      const sx = e.clientX - rect.left
+      const sy = e.clientY - rect.top
+      const { x, y } = r.screenToWorld(sx, sy)
+
+      // 查找点击位置下的文本元素
+      const elements = useCanvasStore.getState().elements
+      const clickedText = elements.find((el) => {
+        if (el.type !== 'text') return false
+        return x >= el.x && x <= el.x + el.width && y >= el.y && y <= el.y + el.height
+      })
+
+      if (clickedText) {
+        // 进入编辑模式时清除选中状态，避免选区边框和编辑框同时出现
+        useCanvasStore.getState().clearSelection()
+        setEditingTextId(clickedText.id)
+      }
+    },
+    [renderer, editingTextId]
   )
 
   const handleBack = () => {
@@ -178,11 +227,24 @@ export default function WhiteboardPage() {
             onMouseMove={onMouseMove}
             onMouseUp={onMouseUp}
             onWheel={handleWheel}
+            onDoubleClick={onDoubleClick}
           />
 
-          {/* 当前工具提示 */}
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-gray-800 text-white text-xs px-3 py-1.5 rounded-full opacity-70 pointer-events-none">
-            {getToolHint(canvasStore.activeTool)}
+          {/* 文本编辑覆盖层 */}
+          <TextEditor
+            renderer={renderer}
+            editingElementId={editingTextId}
+            onFinish={() => setEditingTextId(null)}
+          />
+
+          {/* 当前工具提示 - Figma 风格，不透明背景遮住网格 */}
+          <div className="absolute bottom-5 left-1/2 -translate-x-1/2 pointer-events-none z-50">
+            <div className="flex items-center gap-2 px-4 py-2 bg-white rounded-xl shadow-[0_4px_16px_rgba(0,0,0,0.12)] border border-gray-100">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+              <span className="text-[11px] text-gray-500 font-medium tracking-wide">
+                {getToolHint(canvasStore.activeTool)}
+              </span>
+            </div>
           </div>
         </div>
 
