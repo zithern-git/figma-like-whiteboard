@@ -21,10 +21,38 @@ export default function WhiteboardListPage() {
   const [newName, setNewName] = useState('')
   const [joinCode, setJoinCode] = useState('')
   const [error, setError] = useState('')
+  /** 记录刚刚复制了哪个白板码，用于显示"已复制"反馈 */
+  const [copiedId, setCopiedId] = useState<string | null>(null)
 
   const loadWhiteboards = useCallback(() => {
     fetchWhiteboards()
   }, [fetchWhiteboards])
+
+  /**
+   * 复制白板码到剪贴板。复制成功时短暂显示"已复制"反馈（1.5s 后清除）。
+   * 必须 e.stopPropagation() 防止冒泡触发卡片点击跳转。
+   */
+  const handleCopyCode = useCallback(
+    async (e: React.MouseEvent, shortId: string, wbId: string) => {
+      e.stopPropagation()
+      try {
+        await navigator.clipboard.writeText(shortId)
+        setCopiedId(wbId)
+        setTimeout(() => setCopiedId(null), 1500)
+      } catch {
+        // 降级：选中文本让用户手动复制
+        const ta = document.createElement('textarea')
+        ta.value = shortId
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        document.body.removeChild(ta)
+        setCopiedId(wbId)
+        setTimeout(() => setCopiedId(null), 1500)
+      }
+    },
+    []
+  )
 
   useEffect(() => {
     loadWhiteboards()
@@ -168,6 +196,54 @@ export default function WhiteboardListPage() {
                       </svg>
                     </button>
                   )}
+                </div>
+                {/* ========== 白板码 + 一键复制 ========== */}
+                <div className="flex items-center gap-1.5 mb-3">
+                  <span className="text-xs text-gray-500">白板码</span>
+                  <code className="px-1.5 py-0.5 bg-gray-100 rounded text-xs font-mono text-gray-800 tracking-wide select-all">
+                    {wb.shortId}
+                  </code>
+                  <button
+                    onClick={(e) => handleCopyCode(e, wb.shortId, wb.id)}
+                    className="ml-auto px-2 py-0.5 text-xs text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors flex items-center gap-1"
+                    title="复制白板码"
+                  >
+                    {copiedId === wb.id ? (
+                      <>
+                        <svg
+                          className="w-3.5 h-3.5"
+                          fill="none"
+                          stroke="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={2}
+                            d="M5 13l4 4L19 7"
+                          />
+                        </svg>
+                        <span>已复制</span>
+                      </>
+                    ) : (
+                      <>
+                        <svg
+                          className="w-3.5 h-3.5"
+                          fill="none"
+                          stroke="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={2}
+                            d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                          />
+                        </svg>
+                        <span>复制</span>
+                      </>
+                    )}
+                  </button>
                 </div>
                 <div className="flex items-center gap-2 text-xs text-gray-500">
                   <span>
