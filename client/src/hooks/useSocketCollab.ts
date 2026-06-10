@@ -100,7 +100,12 @@ export function useSocketCollab(
     setConnectionStatus('connecting')
 
     // Socket.IO 客户端配置：指数退避重连
-    const socket = io(import.meta.env.VITE_API_BASE || 'http://localhost:3000', {
+    // 关键修复：使用 Vite 代理路径 /socket.io（同源），不直连后端端口
+    //   - 开发环境：Vite dev server (5173) 代理 /socket.io → localhost:3001
+    //   - 生产环境：Nginx 同源代理
+    // 直连后端会跨域 + 端口不一致，是导致"离线"状态的原因
+    const socket = io({
+      path: '/socket.io',
       auth: { token },
       reconnection: true,
       reconnectionDelay: 1000,
