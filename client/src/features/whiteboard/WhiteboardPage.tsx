@@ -16,6 +16,7 @@ import { useElementSelection } from '@/hooks/useElementSelection'
 import { useElementTransform } from '@/hooks/useElementTransform'
 import { useImageUpload } from '@/hooks/useImageUpload'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
+import { useSocketCollab } from '@/hooks/useSocketCollab'
 import { useAuthStore } from '@/stores/authStore'
 import { useWhiteboardStore } from '@/stores/whiteboardStore'
 import Toolbar from '@/components/canvas/Toolbar'
@@ -60,6 +61,13 @@ export default function WhiteboardPage() {
     onDrop,
     onPaste,
   } = useImageUpload(renderer)
+
+  // ========== 实时协作（Phase 6.1） ==========
+  // 连接 Socket.IO，加入白板，接收远端 op，发送上行 op
+  // 注：sendCursorMove 用于协议完整性，UI 显示留到 6.5；本阶段不在 UI 调用
+  const { connectionStatus, onlineUsers } = useSocketCollab(
+    isLoading ? null : (id ?? null)
+  )
 
   // 键盘快捷键
   useKeyboardShortcuts(renderer)
@@ -311,6 +319,57 @@ export default function WhiteboardPage() {
           <span className="text-xs text-gray-500">
             {canvasStore.elements.length} 个元素
           </span>
+
+          {/* ========== 协作状态（Phase 6.1） ========== */}
+          <div className="w-px h-5 bg-gray-200 mx-2" />
+
+          {/* 连接状态指示器 */}
+          <div className="flex items-center gap-1.5">
+            <span
+              className={`w-2 h-2 rounded-full ${
+                connectionStatus === 'connected'
+                  ? 'bg-green-500'
+                  : connectionStatus === 'connecting'
+                    ? 'bg-yellow-500 animate-pulse'
+                    : 'bg-gray-300'
+              }`}
+              title={
+                connectionStatus === 'connected'
+                  ? '已连接'
+                  : connectionStatus === 'connecting'
+                    ? '连接中...'
+                    : '未连接'
+              }
+            />
+            <span className="text-xs text-gray-500">
+              {connectionStatus === 'connected'
+                ? '已连接'
+                : connectionStatus === 'connecting'
+                  ? '连接中'
+                  : '离线'}
+            </span>
+          </div>
+
+          {/* 在线用户头像列表 */}
+          {onlineUsers.length > 0 && (
+            <div className="flex items-center -space-x-1.5 ml-2">
+              {onlineUsers.slice(0, 5).map((u) => (
+                <div
+                  key={u.userId}
+                  className="w-6 h-6 rounded-full border-2 border-white flex items-center justify-center text-[10px] font-medium text-white shadow-sm"
+                  style={{ backgroundColor: u.color }}
+                  title={u.name}
+                >
+                  {u.name.charAt(0).toUpperCase()}
+                </div>
+              ))}
+              {onlineUsers.length > 5 && (
+                <div className="w-6 h-6 rounded-full border-2 border-white bg-gray-200 flex items-center justify-center text-[10px] text-gray-600 shadow-sm">
+                  +{onlineUsers.length - 5}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </header>
 

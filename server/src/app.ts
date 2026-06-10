@@ -1,19 +1,16 @@
 import cors from 'cors'
 import express from 'express'
 import { createServer } from 'http'
-import { Server } from 'socket.io'
 import { errorHandler } from './middleware/errorHandler'
 import authRoutes from './routes/authRoutes'
 import whiteboardRoutes from './routes/whiteboardRoutes'
+import { initializeSocket } from './sockets'
 
 const app = express()
 const httpServer = createServer(app)
-const io = new Server(httpServer, {
-  cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    credentials: true,
-  },
-})
+
+// 初始化 Socket.IO（统一在 sockets 模块中创建 + 注册 handler）
+initializeSocket(httpServer)
 
 app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:5173',
@@ -39,4 +36,4 @@ app.use((_req, res) => {
 
 app.use(errorHandler)
 
-export { app, httpServer, io }
+export { app, httpServer }

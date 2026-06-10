@@ -23,15 +23,25 @@
 import { create } from 'zustand'
 import { nanoid } from 'nanoid'
 import { CanvasElement, ToolType, Viewport } from '@/canvas/CanvasElement'
-import {
-  AddElementCommand,
-  ClearAllElementsCommand,
-  Command,
-  CommandStore,
-  DeleteElementCommand,
-  UpdateElementCommand,
-} from '@/utils/Command'
+import { AddElementCommand, ClearAllElementsCommand, Command, CommandStore, DeleteElementCommand, UpdateElementCommand } from '@/utils/Command'
 import { UndoManager } from '@/utils/UndoManager'
+
+// ========== 协作 op 协议（与服务端协议对齐） ==========
+
+/** 客户端上行 op（无 userId，userId 由 socket 认证注入） */
+export interface ClientOp {
+  /** 客户端生成的 UUID，用于服务端广播回传时去重 */
+  clientOpId: string
+  opType: 'add' | 'update' | 'delete' | 'clear-all'
+  /** op 负载：add→{element}, update→{id, updates}, delete→{id}, clear-all→{} */
+  payload: any
+  timestamp: number
+}
+
+/** 服务端下行 op（带 userId） */
+export interface ServerOp extends ClientOp {
+  userId: string
+}
 
 /**
  * Canvas 状态接口
@@ -139,6 +149,23 @@ interface CanvasState {
   _replaceElementRaw: (element: CanvasElement) => void
   _setElementsRaw: (elements: CanvasElement[]) => void
 
+  // ========== 协作上行 / 下行（6.1 实时事件层） ==========
+  /**
+   * 上行 op 广播回调（由 useSocketCollab 注入）。
+   * 未连接时是 no-op。
+   */
+  _broadcastOp: (op: ClientOp) => void
+  /**
+   * 应用远端 op：直接走 _raw 方法，不入 undo 栈、不再广播。
+   * 用于 socket 收到 element-op 时调用。
+   */
+  _applyRemoteOp: (op: ServerOp) => void
+  /**
+   * 注入 / 清除广播回调。
+   * useSocketCollab 在 connect 时注入，disconnect 时清除。
+   */
+  setBroadcastOp: (fn: ((op: ClientOp) => void) | null) => void
+
   // ========== 元素工厂 ==========
   /** 创建元素（不添加到列表，只返回元素对象） */
   createElement: (
@@ -174,6 +201,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     _setElementsRaw: (elements) => set({ elements }),
   }
 
+  // ========== 协作 op 上行回调（由 useSocketCollab 注入） ==========
+  // 默认 no-op。未连接 / 断开时调用不报错
+  let broadcastOp: (op: ClientOp) => void = () => {}
+
   return {
     elements: [],
     selectedIds: new Set<string>(),
@@ -192,24 +223,45 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     textColor: '#000000',
     cornerRadius: 0,
 
-    // ========== 元素操作（走 UndoManager） ==========
+    // ========== 元素操作（走 UndoManager + 上行广播） ==========
 
     addElement: (element) => {
+      const clientOpId = nanoid()
       undoManager.execute(new AddElementCommand(self, element))
+      broadcastOp({
+        clientOpId,
+        opType: 'add',
+        payload: { element },
+        timestamp: Date.now(),
+      })
     },
 
     deleteElement: (id) => {
       const element = get().elements.find((e) => e.id === id)
       if (!element) return
+      const clientOpId = nanoid()
       undoManager.execute(new DeleteElementCommand(self, element))
+      broadcastOp({
+        clientOpId,
+        opType: 'delete',
+        payload: { id },
+        timestamp: Date.now(),
+      })
     },
 
     updateElement: (id, updates) => {
+      const clientOpId = nanoid()
       undoManager.execute(new UpdateElementCommand(self, id, updates))
+      broadcastOp({
+        clientOpId,
+        opType: 'update',
+        payload: { id, updates },
+        timestamp: Date.now(),
+      })
     },
 
     /**
-     * setElements：直接全量替换，不入 undo 栈。
+     * setElements：直接全量替换，不入 undo 栈，不上行广播。
      * 用于：白板加载、协作同步的快照恢复等场景。
      * 注意：调用前应清空 undo 栈（避免与历史不一致）。
      */
@@ -219,9 +271,16 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     },
 
     clearAllElements: () => {
+      const clientOpId = nanoid()
       undoManager.execute(
         new ClearAllElementsCommand(self, get().elements)
       )
+      broadcastOp({
+        clientOpId,
+        opType: 'clear-all',
+        payload: {},
+        timestamp: Date.now(),
+      })
     },
 
     // ========== 选择操作 ==========
@@ -253,6 +312,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     /**
      * 删除所有选中元素：合并为单次 undo（一步还原全部）。
      * 同时从 selectedIds 移除已删除项。
+     * 每个删除操作都广播一个独立 op（去重由 clientOpId 保证）。
      */
     deleteSelectedElements: () => {
       const state = get()
@@ -261,7 +321,15 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       undoManager.beginBatch('delete-selected')
       for (const id of ids) {
         const el = state.elements.find((e) => e.id === id)
-        if (el) undoManager.execute(new DeleteElementCommand(self, el))
+        if (!el) continue
+        const clientOpId = nanoid()
+        undoManager.execute(new DeleteElementCommand(self, el))
+        broadcastOp({
+          clientOpId,
+          opType: 'delete',
+          payload: { id },
+          timestamp: Date.now(),
+        })
       }
       undoManager.endBatch()
       set({ selectedIds: new Set() })
@@ -270,6 +338,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     /**
      * 复制选中元素：合并为单次 undo（Ctrl+Z 一次删除全部副本）。
      * 复制后选区替换为新副本。
+     * 每个副本广播一个独立 add op。
      */
     duplicateSelected: () => {
       const state = get()
@@ -293,7 +362,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           y: el.y + 20,
           points: newPoints,
         })
+        const clientOpId = nanoid()
         undoManager.execute(new AddElementCommand(self, copy))
+        broadcastOp({
+          clientOpId,
+          opType: 'add',
+          payload: { element: copy },
+          timestamp: Date.now(),
+        })
         newIds.add(copy.id)
       })
       undoManager.endBatch()
@@ -337,6 +413,56 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     _removeElementRaw: self._removeElementRaw,
     _replaceElementRaw: self._replaceElementRaw,
     _setElementsRaw: self._setElementsRaw,
+
+    // ========== 协作 op 上行 / 下行 ==========
+
+    /**
+     * 上行 op 广播：直接调用注入的回调。空回调是 no-op。
+     * 暴露为 store 字段（而非方法），保持调用方零成本。
+     */
+    _broadcastOp: (op) => broadcastOp(op),
+
+    /**
+     * 应用远端 op：直接走 _raw 方法（不入 undo 栈、不广播）。
+     * - add:        _addElementRaw
+     * - update:     _replaceElementRaw
+     * - delete:     _removeElementRaw
+     * - clear-all:  _setElementsRaw([])
+     */
+    _applyRemoteOp: (op) => {
+      switch (op.opType) {
+        case 'add': {
+          const el = op.payload?.element
+          if (el?.id) self._addElementRaw(el)
+          break
+        }
+        case 'update': {
+          const { id, updates } = op.payload ?? {}
+          if (!id) return
+          const current = self._getElementRaw(id)
+          if (!current) return
+          self._replaceElementRaw({ ...current, ...updates, id })
+          break
+        }
+        case 'delete': {
+          const { id } = op.payload ?? {}
+          if (id) self._removeElementRaw(id)
+          break
+        }
+        case 'clear-all': {
+          self._setElementsRaw([])
+          break
+        }
+      }
+    },
+
+    /**
+     * 注入 / 清除上行 op 广播回调。
+     * useSocketCollab 在 connect 时注入；disconnect 时清除。
+     */
+    setBroadcastOp: (fn) => {
+      broadcastOp = fn ?? (() => {})
+    },
 
     // ========== 元素工厂 ==========
 
