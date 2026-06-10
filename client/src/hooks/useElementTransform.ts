@@ -101,6 +101,12 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
       activeHandle.current = hit.type === "scale" ? hit.handle : null;
       isTransforming.current = true;
 
+      // 关键修复：开始一个 undo batch，把整个拖拽/缩放/旋转过程中产生的
+      // 多次 updateElement 合并为一次 undo（按 Ctrl+Z 一步还原到拖拽前状态）。
+      // batchId 包含 elementId 防止与其他元素的变换冲突。
+      const transformBatchId = `transform-${Array.from(state.selectedIds).join("-")}-${Date.now()}`;
+      useCanvasStore.getState().beginUndoBatch(transformBatchId);
+
       // 记录所有选中元素的初始状态
       elementStatesBefore.current = new Map();
       for (const id of state.selectedIds) {
@@ -368,6 +374,11 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
    */
   const handleTransformEnd = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
+      // 关键修复：结束 undo batch，把所有 updateElement 合并为单次 undo 步骤。
+      // 放在 isTransforming 重置前，确保 batch 内已经有累积的命令。
+      if (isTransforming.current) {
+        useCanvasStore.getState().endUndoBatch();
+      }
       isTransforming.current = false;
       transformType.current = "none";
       activeHandle.current = null;

@@ -92,6 +92,12 @@ export function useKeyboardShortcuts(renderer: CanvasRenderer | null) {
       // ========== Ctrl+Shift 组合键 ==========
       if (ctrl && shift) {
         switch (key) {
+          case 'z': {
+            // Ctrl+Shift+Z：重做（Mac 习惯的快捷键）
+            e.preventDefault()
+            store.redo()
+            break
+          }
           case 'e': {
             // Ctrl+Shift+E：导出为 PNG
             e.preventDefault()

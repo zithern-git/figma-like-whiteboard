@@ -389,6 +389,11 @@ export function useDrawTool(_renderer: CanvasRenderer | null) {
         isDrawing.current = true;
         startPt.current = { x, y };
         curPt.current = { x, y };
+        // 关键修复：擦除时把整段拖拽中删除的所有元素合并为单次 undo
+        // （用户拖动橡皮擦擦过多个元素，Ctrl+Z 一步还原全部）
+        useCanvasStore
+          .getState()
+          .beginUndoBatch(`erase-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
         eraseAt(x, y, renderer.getViewport().zoom);
         renderer.addTemporaryDraw(TEMP_DRAW_ID, buildPreviewRender(), 10);
         return;
@@ -448,6 +453,13 @@ export function useDrawTool(_renderer: CanvasRenderer | null) {
       }
 
       const tool = activeTool.current;
+
+      // 关键修复：擦除结束 — 关闭 erase batch，把整段拖拽中所有 deleteElement
+      // 合并为单次 undo 步骤。
+      if (tool === "eraser") {
+        useCanvasStore.getState().endUndoBatch();
+      }
+
       const p0 = startPt.current;
       const p1 = curPt.current;
 
@@ -512,7 +524,14 @@ export function useDrawTool(_renderer: CanvasRenderer | null) {
           break;
         }
       }
-      if (el) store.addElement(el);
+      if (el) {
+        // 关键修复：包裹在 batch 中，使"一次完整绘制"对应一次 undo 步骤，
+        // 未来若单次绘制产生多个元素时也能自动合并。
+        const drawBatchId = `draw-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+        useCanvasStore.getState().beginUndoBatch(drawBatchId)
+        store.addElement(el)
+        useCanvasStore.getState().endUndoBatch()
+      }
     },
     [store, isEditingText]
   );

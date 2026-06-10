@@ -6,32 +6,32 @@
  * - 选中元素（selectedIds）
  * - 当前活动工具（activeTool）
  * - 视口状态（viewport）
- * - 撤销/重做栈（undoStack / redoStack）
+ * - 撤销/重做栈（undoStack / redoStack 快照）
  *
- * 所有元素变更操作都通过此 store 统一管理，
- * 确保状态一致性和可预测性。
+ * 所有元素变更操作都通过 Command 模式（utils/Command.ts）执行，
+ * 由 UndoManager（utils/UndoManager.ts）管理历史栈。
+ *
+ * 公开 API 保持向后兼容：
+ * - addElement / updateElement / deleteElement / clearAllElements 创建 Command 压栈
+ * - undo / redo 由 UndoManager 提供
+ * - undoStack / redoStack 字段作为只读快照供 React 订阅
+ *
+ * 内部 _raw 后缀方法：仅供 Command 重放使用，绕过 UndoManager
+ * 防止 undo/redo 本身被记入历史栈。
  */
 
 import { create } from 'zustand'
 import { nanoid } from 'nanoid'
+import { CanvasElement, ToolType, Viewport } from '@/canvas/CanvasElement'
 import {
-  CanvasElement,
-  ToolType,
-  Viewport,
-} from '@/canvas/CanvasElement'
-
-/**
- * 命令接口：用于撤销/重做系统
- * 每个操作都封装为命令对象，包含 execute() 和 undo() 方法
- */
-export interface Command {
-  /** 命令类型 */
-  type: 'add' | 'delete' | 'update' | 'clear-all'
-  /** 执行命令 */
-  execute: () => void
-  /** 撤销命令 */
-  undo: () => void
-}
+  AddElementCommand,
+  ClearAllElementsCommand,
+  Command,
+  CommandStore,
+  DeleteElementCommand,
+  UpdateElementCommand,
+} from '@/utils/Command'
+import { UndoManager } from '@/utils/UndoManager'
 
 /**
  * Canvas 状态接口
@@ -47,11 +47,11 @@ interface CanvasState {
   /** 视口状态 */
   viewport: Viewport
 
-  // ========== 撤销/重做栈 ==========
-  /** 撤销栈 */
-  undoStack: Command[]
-  /** 重做栈 */
-  redoStack: Command[]
+  // ========== 撤销/重做栈（只读快照，由 UndoManager 同步） ==========
+  /** 撤销栈快照 */
+  undoStack: readonly Command[]
+  /** 重做栈快照 */
+  redoStack: readonly Command[]
 
   // ========== 样式状态 ==========
   /** 描边颜色 */
@@ -62,15 +62,22 @@ interface CanvasState {
   strokeWidth: number
   /** 字号 */
   fontSize: number
+  fontFamily: string
+  fontWeight: 'normal' | 'bold'
+  fontStyle: 'normal' | 'italic'
+  textAlign: 'left' | 'center' | 'right'
+  textColor: string
+  /** 默认矩形圆角半径 */
+  cornerRadius: number
 
-  // ========== 元素操作 ==========
+  // ========== 元素操作（走 UndoManager，自动入栈） ==========
   /** 添加元素 */
   addElement: (element: CanvasElement) => void
   /** 删除元素 */
   deleteElement: (id: string) => void
   /** 更新元素 */
   updateElement: (id: string, updates: Partial<CanvasElement>) => void
-  /** 设置元素列表（用于初始化或全量替换） */
+  /** 设置元素列表（用于初始化或全量替换，不入栈） */
   setElements: (elements: CanvasElement[]) => void
   /** 清空所有元素 */
   clearAllElements: () => void
@@ -88,9 +95,9 @@ interface CanvasState {
   clearSelection: () => void
   /** 全选 */
   selectAll: () => void
-  /** 删除选中元素 */
+  /** 删除选中元素（合并为单次 undo） */
   deleteSelectedElements: () => void
-  /** 复制选中元素 */
+  /** 复制选中元素（合并为单次 undo） */
   duplicateSelected: () => void
 
   // ========== 工具与视口 ==========
@@ -100,32 +107,37 @@ interface CanvasState {
   setViewport: (viewport: Partial<Viewport>) => void
 
   // ========== 样式设置 ==========
-  /** 设置描边颜色 */
   setStrokeColor: (color: string) => void
-  /** 设置填充颜色 */
   setFillColor: (color: string) => void
-  /** 设置描边宽度 */
   setStrokeWidth: (width: number) => void
-  /** 设置字号 */
   setFontSize: (size: number) => void
-  /** 设置字体 */
   setFontFamily: (family: string) => void
-  /** 设置字重 */
   setFontWeight: (weight: 'normal' | 'bold') => void
-  /** 设置斜体 */
   setFontStyle: (style: 'normal' | 'italic') => void
-  /** 设置文字对齐 */
   setTextAlign: (align: 'left' | 'center' | 'right') => void
-  /** 设置文字颜色 */
   setTextColor: (color: string) => void
-  /** 设置默认矩形圆角半径 */
   setCornerRadius: (radius: number) => void
 
-  // ========== 撤销/重做 ==========
+  // ========== 撤销/重做（公开 API） ==========
   /** 撤销 */
   undo: () => void
   /** 重做 */
   redo: () => void
+  /** 开始一个 undo batch（后续 execute 同 batchId 的命令会合并） */
+  beginUndoBatch: (id: string) => void
+  /** 结束当前 undo batch */
+  endUndoBatch: () => void
+  /** 是否可撤销（供 UI 按钮 disabled 状态） */
+  canUndo: () => boolean
+  /** 是否可重做 */
+  canRedo: () => boolean
+
+  // ========== CommandStore 接口（_raw 后缀，仅供 Command 调用） ==========
+  _getElementRaw: (id: string) => CanvasElement | undefined
+  _addElementRaw: (element: CanvasElement) => void
+  _removeElementRaw: (id: string) => void
+  _replaceElementRaw: (element: CanvasElement) => void
+  _setElementsRaw: (elements: CanvasElement[]) => void
 
   // ========== 元素工厂 ==========
   /** 创建元素（不添加到列表，只返回元素对象） */
@@ -135,269 +147,227 @@ interface CanvasState {
   ) => CanvasElement
 }
 
-export const useCanvasStore = create<CanvasState>((set, get) => ({
-  elements: [],
-  selectedIds: new Set<string>(),
-  activeTool: 'select',
-  viewport: { translateX: 0, translateY: 0, zoom: 1 },
-  undoStack: [],
-  redoStack: [],
-  strokeColor: '#000000',
-  fillColor: '#FFFFFF',
-  strokeWidth: 2,
-  fontSize: 16,
-  fontFamily: 'Arial',
-  fontWeight: 'normal',
-  fontStyle: 'normal',
-  textAlign: 'left',
-  textColor: '#000000',
-  cornerRadius: 0,
+export const useCanvasStore = create<CanvasState>((set, get) => {
+  // ========== 内部 UndoManager 实例 ==========
+  // onChange 把栈快照同步到 React state，触发订阅
+  // 关键：用 [...arr] 创建新数组引用，React 才能检测到引用变化并重新渲染
+  const undoManager = new UndoManager(() => {
+    set({
+      undoStack: [...undoManager.getUndoStackSnapshot()],
+      redoStack: [...undoManager.getRedoStackSnapshot()],
+    })
+  })
 
-  // ========== 元素操作 ==========
+  /** 工具：把当前 state 当作 CommandStore 传给 Command */
+  const self: CommandStore = {
+    _getElementRaw: (id) => get().elements.find((e) => e.id === id),
+    _addElementRaw: (element) =>
+      set((s) => ({ elements: [...s.elements, element] })),
+    _removeElementRaw: (id) =>
+      set((s) => ({
+        elements: s.elements.filter((e) => e.id !== id),
+      })),
+    _replaceElementRaw: (element) =>
+      set((s) => ({
+        elements: s.elements.map((e) => (e.id === element.id ? element : e)),
+      })),
+    _setElementsRaw: (elements) => set({ elements }),
+  }
 
-  addElement: (element: CanvasElement) => {
-    const command: Command = {
-      type: 'add',
-      execute: () => {
-        set((state) => ({
-          elements: [...state.elements, element],
-          undoStack: [...state.undoStack, command],
-          redoStack: [],
-        }))
-      },
-      undo: () => {
-        set((state) => ({
-          elements: state.elements.filter((e) => e.id !== element.id),
-        }))
-      },
-    }
-    command.execute()
-  },
+  return {
+    elements: [],
+    selectedIds: new Set<string>(),
+    activeTool: 'select',
+    viewport: { translateX: 0, translateY: 0, zoom: 1 },
+    undoStack: [],
+    redoStack: [],
+    strokeColor: '#000000',
+    fillColor: '#FFFFFF',
+    strokeWidth: 2,
+    fontSize: 16,
+    fontFamily: 'Arial',
+    fontWeight: 'normal',
+    fontStyle: 'normal',
+    textAlign: 'left',
+    textColor: '#000000',
+    cornerRadius: 0,
 
-  deleteElement: (id: string) => {
-    const element = get().elements.find((e) => e.id === id)
-    if (!element) return
+    // ========== 元素操作（走 UndoManager） ==========
 
-    const command: Command = {
-      type: 'delete',
-      execute: () => {
-        set((state) => ({
-          elements: state.elements.filter((e) => e.id !== id),
-          selectedIds: new Set(
-            Array.from(state.selectedIds).filter((sid) => sid !== id)
-          ),
-          undoStack: [...state.undoStack, command],
-          redoStack: [],
-        }))
-      },
-      undo: () => {
-        set((state) => ({
-          elements: [...state.elements, element],
-        }))
-      },
-    }
-    command.execute()
-  },
+    addElement: (element) => {
+      undoManager.execute(new AddElementCommand(self, element))
+    },
 
-  updateElement: (id: string, updates: Partial<CanvasElement>) => {
-    const oldElement = get().elements.find((e) => e.id === id)
-    if (!oldElement) return
+    deleteElement: (id) => {
+      const element = get().elements.find((e) => e.id === id)
+      if (!element) return
+      undoManager.execute(new DeleteElementCommand(self, element))
+    },
 
-    const command: Command = {
-      type: 'update',
-      execute: () => {
-        set((state) => ({
-          elements: state.elements.map((e) =>
-            e.id === id ? { ...e, ...updates, updatedAt: Date.now() } : e
-          ),
-          undoStack: [...state.undoStack, command],
-          redoStack: [],
-        }))
-      },
-      undo: () => {
-        set((state) => ({
-          elements: state.elements.map((e) =>
-            e.id === id ? { ...e, ...oldElement } : e
-          ),
-        }))
-      },
-    }
-    command.execute()
-  },
+    updateElement: (id, updates) => {
+      undoManager.execute(new UpdateElementCommand(self, id, updates))
+    },
 
-  setElements: (elements: CanvasElement[]) => set({ elements }),
+    /**
+     * setElements：直接全量替换，不入 undo 栈。
+     * 用于：白板加载、协作同步的快照恢复等场景。
+     * 注意：调用前应清空 undo 栈（避免与历史不一致）。
+     */
+    setElements: (elements) => {
+      undoManager.clear()
+      set({ elements })
+    },
 
-  clearAllElements: () => {
-    const oldElements = get().elements
-    const command: Command = {
-      type: 'clear-all',
-      execute: () => {
-        set((state) => ({
-          elements: [],
-          selectedIds: new Set(),
-          undoStack: [...state.undoStack, command],
-          redoStack: [],
-        }))
-      },
-      undo: () => {
-        set({ elements: oldElements })
-      },
-    }
-    command.execute()
-  },
+    clearAllElements: () => {
+      undoManager.execute(
+        new ClearAllElementsCommand(self, get().elements)
+      )
+    },
 
-  // ========== 选择操作 ==========
+    // ========== 选择操作 ==========
 
-  setSelectedIds: (ids: Set<string>) => set({ selectedIds: ids }),
+    setSelectedIds: (ids) => set({ selectedIds: ids }),
 
-  selectElement: (id: string) =>
-    set((state) => ({
-      selectedIds: new Set([id]),
-    })),
+    selectElement: (id) => set({ selectedIds: new Set([id]) }),
 
-  deselectAll: () => set({ selectedIds: new Set() }),
+    deselectAll: () => set({ selectedIds: new Set() }),
 
-  toggleSelected: (id: string) =>
-    set((state) => {
-      const newSet = new Set(state.selectedIds)
-      if (newSet.has(id)) {
-        newSet.delete(id)
-      } else {
-        newSet.add(id)
+    toggleSelected: (id) =>
+      set((state) => {
+        const newSet = new Set(state.selectedIds)
+        if (newSet.has(id)) {
+          newSet.delete(id)
+        } else {
+          newSet.add(id)
+        }
+        return { selectedIds: newSet }
+      }),
+
+    clearSelection: () => set({ selectedIds: new Set() }),
+
+    selectAll: () =>
+      set((state) => ({
+        selectedIds: new Set(state.elements.map((e) => e.id)),
+      })),
+
+    /**
+     * 删除所有选中元素：合并为单次 undo（一步还原全部）。
+     * 同时从 selectedIds 移除已删除项。
+     */
+    deleteSelectedElements: () => {
+      const state = get()
+      const ids = Array.from(state.selectedIds)
+      if (ids.length === 0) return
+      undoManager.beginBatch('delete-selected')
+      for (const id of ids) {
+        const el = state.elements.find((e) => e.id === id)
+        if (el) undoManager.execute(new DeleteElementCommand(self, el))
       }
-      return { selectedIds: newSet }
-    }),
+      undoManager.endBatch()
+      set({ selectedIds: new Set() })
+    },
 
-  clearSelection: () => set({ selectedIds: new Set() }),
+    /**
+     * 复制选中元素：合并为单次 undo（Ctrl+Z 一次删除全部副本）。
+     * 复制后选区替换为新副本。
+     */
+    duplicateSelected: () => {
+      const state = get()
+      const selected = state.elements.filter((e) =>
+        state.selectedIds.has(e.id)
+      )
+      if (selected.length === 0) return
 
-  selectAll: () =>
-    set((state) => ({
-      selectedIds: new Set(state.elements.map((e) => e.id)),
-    })),
-
-  deleteSelectedElements: () => {
-    const ids = Array.from(get().selectedIds)
-    if (ids.length === 0) return
-    ids.forEach((id) => get().deleteElement(id))
-    set({ selectedIds: new Set() })
-  },
-
-  duplicateSelected: () => {
-    const state = get()
-    const selected = state.elements.filter((e) => state.selectedIds.has(e.id))
-    // 关键修复：复制完成后，把新副本设为选中（替换原元素的选中状态）
-    // 这样拖拽移动时只移动副本，原元素保持不动
-    const newIds = new Set<string>()
-    selected.forEach((el) => {
-      // 关键修复：pen 和 line 元素的真实位置在 points 中（绝对坐标），
-      // 只偏移 x/y 不偏移 points 会导致副本与原元素位置错乱
-      let newPoints = el.points
-      if ((el.type === 'pen' || el.type === 'line') && el.points) {
-        newPoints = el.points.map((p) => ({ x: p.x + 20, y: p.y + 20 }))
-      }
-      // 关键修复：必须排除 el.id，让 createElement 使用新生成的 nanoid()，
-      // 否则所有副本都会沿用原元素 id，拖拽时 updateElement 只会更新第一个匹配项，
-      // 导致多个副本"塌缩"成一个
-      const { id: _ignored, ...rest } = el
-      const copy = state.createElement(el.type, {
-        ...rest,
-        x: el.x + 20,
-        y: el.y + 20,
-        points: newPoints,
+      const newIds = new Set<string>()
+      undoManager.beginBatch('duplicate-selected')
+      selected.forEach((el) => {
+        let newPoints = el.points
+        if ((el.type === 'pen' || el.type === 'line') && el.points) {
+          newPoints = el.points.map((p) => ({ x: p.x + 20, y: p.y + 20 }))
+        }
+        // 排除原 id，让 createElement 生成新 id
+        const { id: _ignored, ...rest } = el
+        const copy = state.createElement(el.type, {
+          ...rest,
+          x: el.x + 20,
+          y: el.y + 20,
+          points: newPoints,
+        })
+        undoManager.execute(new AddElementCommand(self, copy))
+        newIds.add(copy.id)
       })
-      state.addElement(copy)
-      newIds.add(copy.id)
-    })
-    // 关键修复：把 selectedIds 改为只包含新副本
-    set({ selectedIds: newIds })
-  },
+      undoManager.endBatch()
+      set({ selectedIds: newIds })
+    },
 
-  // ========== 工具与视口 ==========
+    // ========== 工具与视口 ==========
 
-  setTool: (tool: ToolType) => set({ activeTool: tool }),
+    setTool: (tool) => set({ activeTool: tool }),
 
-  setViewport: (viewport: Partial<Viewport>) => {
-    set((state) => ({
-      viewport: { ...state.viewport, ...viewport },
-    }))
-  },
+    setViewport: (viewport) => {
+      set((state) => ({ viewport: { ...state.viewport, ...viewport } }))
+    },
 
-  // ========== 样式设置 ==========
+    // ========== 样式设置 ==========
 
-  setStrokeColor: (color: string) => set({ strokeColor: color }),
-  setFillColor: (color: string) => set({ fillColor: color }),
-  setStrokeWidth: (width: number) => set({ strokeWidth: width }),
-  setFontSize: (size: number) => set({ fontSize: size }),
-  setFontFamily: (family: string) => set({ fontFamily: family }),
-  setFontWeight: (weight: 'normal' | 'bold') => set({ fontWeight: weight }),
-  setFontStyle: (style: 'normal' | 'italic') => set({ fontStyle: style }),
-  setTextAlign: (align: 'left' | 'center' | 'right') => set({ textAlign: align }),
-  setTextColor: (color: string) => set({ textColor: color }),
-  setCornerRadius: (radius: number) => set({ cornerRadius: Math.max(0, radius) }),
+    setStrokeColor: (color) => set({ strokeColor: color }),
+    setFillColor: (color) => set({ fillColor: color }),
+    setStrokeWidth: (width) => set({ strokeWidth: width }),
+    setFontSize: (size) => set({ fontSize: size }),
+    setFontFamily: (family) => set({ fontFamily: family }),
+    setFontWeight: (weight) => set({ fontWeight: weight }),
+    setFontStyle: (style) => set({ fontStyle: style }),
+    setTextAlign: (align) => set({ textAlign: align }),
+    setTextColor: (color) => set({ textColor: color }),
+    setCornerRadius: (radius) => set({ cornerRadius: Math.max(0, radius) }),
 
-  // ========== 撤销/重做 ==========
+    // ========== 撤销/重做 ==========
 
-  undo: () => {
-    const { undoStack, redoStack } = get()
-    if (undoStack.length === 0) return
+    undo: () => undoManager.undo(),
+    redo: () => undoManager.redo(),
+    beginUndoBatch: (id) => undoManager.beginBatch(id),
+    endUndoBatch: () => undoManager.endBatch(),
+    canUndo: () => undoManager.canUndo(),
+    canRedo: () => undoManager.canRedo(),
 
-    const command = undoStack[undoStack.length - 1]
-    command.undo()
+    // ========== _raw 方法（CommandStore 接口） ==========
 
-    set({
-      undoStack: undoStack.slice(0, -1),
-      redoStack: [...redoStack, command],
-    })
-  },
+    _getElementRaw: self._getElementRaw,
+    _addElementRaw: self._addElementRaw,
+    _removeElementRaw: self._removeElementRaw,
+    _replaceElementRaw: self._replaceElementRaw,
+    _setElementsRaw: self._setElementsRaw,
 
-  redo: () => {
-    const { undoStack, redoStack } = get()
-    if (redoStack.length === 0) return
+    // ========== 元素工厂 ==========
 
-    const command = redoStack[redoStack.length - 1]
-    command.execute()
+    createElement: (type, overrides) => {
+      const defaults: CanvasElement = {
+        id: nanoid(),
+        type,
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+        rotation: 0,
+        // 透明度反向语义：默认 0 表示完全不透明
+        opacity: 0,
+        fill: get().fillColor,
+        stroke: get().strokeColor,
+        strokeWidth: get().strokeWidth,
+        cornerRadius: type === 'rect' ? get().cornerRadius : undefined,
+        fontSize: type === 'text' ? get().fontSize : undefined,
+        fontFamily: type === 'text' ? get().fontFamily : undefined,
+        fontWeight: type === 'text' ? get().fontWeight : undefined,
+        fontStyle: type === 'text' ? get().fontStyle : undefined,
+        textAlign: type === 'text' ? get().textAlign : undefined,
+        textColor: type === 'text' ? get().textColor : undefined,
+        version: 1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        createdBy: 'current-user',
+      }
 
-    set({
-      undoStack: [...undoStack, command],
-      redoStack: redoStack.slice(0, -1),
-    })
-  },
-
-  // ========== 元素工厂 ==========
-
-  createElement: (
-    type: CanvasElement['type'],
-    overrides?: Partial<CanvasElement>
-  ): CanvasElement => {
-    const defaults: CanvasElement = {
-      id: nanoid(),
-      type,
-      x: 0,
-      y: 0,
-      width: 100,
-      height: 100,
-      rotation: 0,
-      // 关键修复：透明度语义反转后，默认值改为 0（完全不透明），
-      // 而不是旧的 1（在新语义下会变成完全透明）
-      opacity: 0,
-      fill: get().fillColor,
-      stroke: get().strokeColor,
-      strokeWidth: get().strokeWidth,
-      // 矩形默认带当前 store 中的圆角半径；非矩形类型会被 overrides 覆盖或忽略
-      cornerRadius: type === 'rect' ? get().cornerRadius : undefined,
-      // 关键修复：文本元素默认带 store 中的文字样式
-      fontSize: type === 'text' ? get().fontSize : undefined,
-      fontFamily: type === 'text' ? get().fontFamily : undefined,
-      fontWeight: type === 'text' ? get().fontWeight : undefined,
-      fontStyle: type === 'text' ? get().fontStyle : undefined,
-      textAlign: type === 'text' ? get().textAlign : undefined,
-      textColor: type === 'text' ? get().textColor : undefined,
-      version: 1,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      createdBy: 'current-user',
-    }
-
-    return { ...defaults, ...overrides }
-  },
-}))
+      return { ...defaults, ...overrides }
+    },
+  }
+})
