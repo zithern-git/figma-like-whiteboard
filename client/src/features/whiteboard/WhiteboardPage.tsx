@@ -8,18 +8,18 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import Canvas from '@/components/canvas/Canvas'
-import { CanvasRenderer } from '@/canvas'
+import { CanvasRenderer, HitArea } from '@/canvas'
 import { useCanvasStore } from '@/stores/canvasStore'
 import { useCanvasViewport } from '@/hooks/useCanvasViewport'
 import { useDrawTool } from '@/hooks/useDrawTool'
 import { useElementSelection } from '@/hooks/useElementSelection'
 import { useElementTransform } from '@/hooks/useElementTransform'
+import { useImageUpload } from '@/hooks/useImageUpload'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
 import { useAuthStore } from '@/stores/authStore'
 import { useWhiteboardStore } from '@/stores/whiteboardStore'
 import Toolbar from '@/components/canvas/Toolbar'
 import PropertiesPanel from '@/components/canvas/PropertiesPanel'
-import { TextEditor } from '@/components/canvas/TextEditor'
 
 export default function WhiteboardPage() {
   const { id } = useParams<{ id: string }>()
@@ -32,16 +32,6 @@ export default function WhiteboardPage() {
   const [zoom, setZoom] = useState(1)
   const [isLoading, setIsLoading] = useState(true)
 
-  // 文本编辑状态
-  const [editingTextId, setEditingTextId] = useState<string | null>(null)
-
-  // 同步 editingTextId 到 CanvasRenderer，使其跳过渲染正在编辑的文本
-  useEffect(() => {
-    if (renderer) {
-      renderer.setEditingTextId(editingTextId)
-    }
-  }, [renderer, editingTextId])
-
   // 初始化 CanvasRenderer
   const handleRendererReady = useCallback((r: CanvasRenderer) => {
     setRenderer(r)
@@ -53,7 +43,7 @@ export default function WhiteboardPage() {
   })
 
   // 绘图工具
-  const { handleMouseDown, handleMouseMove, handleMouseUp, handleEraser } = useDrawTool(renderer)
+  const { handleMouseDown, handleMouseMove, handleMouseUp, handleEraser, handleDoubleClickText, cleanupTextEditor } = useDrawTool(renderer)
 
   // 元素选择
   const { handleSelect } = useElementSelection(renderer)
@@ -61,8 +51,34 @@ export default function WhiteboardPage() {
   // 元素变换
   const { handleTransformStart, handleTransformMove, handleTransformEnd } = useElementTransform(renderer)
 
+  // 关键修复：图片上传 hook（文件选择器 + 拖拽 + 粘贴）
+  const {
+    fileInputRef,
+    openFilePicker,
+    onFileInputChange,
+    onDragOver,
+    onDrop,
+    onPaste,
+  } = useImageUpload(renderer)
+
   // 键盘快捷键
   useKeyboardShortcuts(renderer)
+
+  // 关键修复：监听 activeTool，激活图片工具时自动打开文件选择器
+  const activeTool = useCanvasStore((s) => s.activeTool)
+  useEffect(() => {
+    if (activeTool === 'image') {
+      openFilePicker()
+      // 选完文件后切回 select 工具，避免用户继续处于 image 模式
+      useCanvasStore.getState().setTool('select')
+    }
+  }, [activeTool, openFilePicker])
+
+  // 关键修复：监听 window 的 paste 事件
+  useEffect(() => {
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [onPaste])
 
   // 加载白板数据
   useEffect(() => {
@@ -73,12 +89,6 @@ export default function WhiteboardPage() {
   // 统一的鼠标事件处理
   const onMouseDown = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      // 如果正在编辑文本，先结束编辑
-      if (editingTextId) {
-        setEditingTextId(null)
-        return
-      }
-
       const activeTool = useCanvasStore.getState().activeTool
 
       if (activeTool === 'select') {
@@ -90,7 +100,100 @@ export default function WhiteboardPage() {
         handleMouseDown(e)
       }
     },
-    [handleSelect, handleTransformStart, handleMouseDown, handleEraser, editingTextId]
+    [handleSelect, handleTransformStart, handleMouseDown, handleEraser]
+  )
+
+  /**
+   * 关键修复：鼠标在画布上移动时，根据 hit test 结果设置光标样式。
+   * - 8 个缩放手柄：双向箭头（方向与缩放方向一致）
+   * - 1 个旋转手柄：Figma 风格的环形箭头（自定义 SVG cursor）
+   * - 元素主体：move
+   * - 其余：default
+   *
+   * 旋转手柄用 SVG data URL 自定义光标，CSS 没有现成的"环形箭头"cursor；
+   * 末尾的 `alias` 是兜底（SVG 加载失败时降级）
+   */
+  const rotateCursorUrl =
+    "data:image/svg+xml;utf8," +
+    encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M21 12a9 9 0 1 1-3.5-7.1"/>' +
+        '<polyline points="21 3 21 9 15 9"/>' +
+        "</svg>"
+    )
+
+  const handleCursorHover = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!renderer) {
+        e.currentTarget.style.cursor = "default"
+        return
+      }
+      const state = useCanvasStore.getState()
+      if (state.activeTool !== "select" || state.selectedIds.size === 0) {
+        e.currentTarget.style.cursor = "default"
+        return
+      }
+
+      const rect = e.currentTarget.getBoundingClientRect()
+      const worldPos = renderer.screenToWorld(
+        e.clientX - rect.left,
+        e.clientY - rect.top
+      )
+
+      const isOnlySelection = state.selectedIds.size === 1
+      let hit: HitArea = { type: "none" }
+      if (isOnlySelection) {
+        const id = Array.from(state.selectedIds)[0]
+        const element = state.elements.find((el) => el.id === id)
+        if (element) {
+          hit = renderer.hitTest(element, worldPos.x, worldPos.y, true)
+        }
+      } else {
+        for (const id of state.selectedIds) {
+          const element = state.elements.find((el) => el.id === id)
+          if (!element) continue
+          const h = renderer.hitTest(
+            element,
+            worldPos.x,
+            worldPos.y,
+            false
+          )
+          if (h.type === "move") {
+            hit = h
+            break
+          }
+        }
+      }
+
+      let cursor: string = "default"
+      if (hit.type === "scale") {
+        switch (hit.handle) {
+          case "tl":
+          case "br":
+            cursor = "nwse-resize"
+            break
+          case "tr":
+          case "bl":
+            cursor = "nesw-resize"
+            break
+          case "tm":
+          case "bm":
+            cursor = "ns-resize"
+            break
+          case "ml":
+          case "mr":
+            cursor = "ew-resize"
+            break
+        }
+      } else if (hit.type === "rotate") {
+        // 关键修复：Figma 风格的环形箭头光标，热点居中 (12, 12)
+        cursor = `url("${rotateCursorUrl}") 12 12, alias`
+      } else if (hit.type === "move") {
+        cursor = "move"
+      }
+      e.currentTarget.style.cursor = cursor
+    },
+    [renderer]
   )
 
   const onMouseMove = useCallback(
@@ -99,11 +202,14 @@ export default function WhiteboardPage() {
 
       if (activeTool === 'select') {
         handleTransformMove(e)
+        // 关键修复：无论是否正在变换，都要更新光标反馈
+        handleCursorHover(e)
       } else {
         handleMouseMove(e)
+        e.currentTarget.style.cursor = 'crosshair'
       }
     },
-    [handleTransformMove, handleMouseMove]
+    [handleTransformMove, handleMouseMove, handleCursorHover]
   )
 
   const onMouseUp = useCallback(
@@ -122,15 +228,11 @@ export default function WhiteboardPage() {
   // 双击事件：编辑文本
   const onDoubleClick = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      // 如果已经在编辑某个文本，不创建新的编辑框
-      if (editingTextId) {
-        return
-      }
-
-      const r = renderer
+      // 优先使用注入的 _getRenderer（Canvas.tsx 在 onDoubleClick 时注入）
+      const r = (e as any)._getRenderer?.() || renderer
       if (!r) return
 
-      const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
+      const rect = (e.currentTarget as HTMLCanvasElement).getBoundingClientRect()
       const sx = e.clientX - rect.left
       const sy = e.clientY - rect.top
       const { x, y } = r.screenToWorld(sx, sy)
@@ -145,10 +247,10 @@ export default function WhiteboardPage() {
       if (clickedText) {
         // 进入编辑模式时清除选中状态，避免选区边框和编辑框同时出现
         useCanvasStore.getState().clearSelection()
-        setEditingTextId(clickedText.id)
+        handleDoubleClickText(e.clientX, e.clientY, clickedText.x, clickedText.y, clickedText, -1)
       }
     },
-    [renderer, editingTextId]
+    [renderer, handleDoubleClickText]
   )
 
   const handleBack = () => {
@@ -215,10 +317,14 @@ export default function WhiteboardPage() {
       {/* 主工作区 */}
       <div className="flex-1 flex overflow-hidden">
         {/* 左侧工具栏 */}
-        <Toolbar renderer={renderer} />
+        <Toolbar onToolChange={cleanupTextEditor} />
 
         {/* 中间 Canvas 画布 */}
-        <div className="flex-1 relative">
+        <div
+          className="flex-1 relative"
+          onDragOver={onDragOver}
+          onDrop={onDrop}
+        >
           <Canvas
             onRendererReady={handleRendererReady}
             elements={canvasStore.elements}
@@ -230,11 +336,13 @@ export default function WhiteboardPage() {
             onDoubleClick={onDoubleClick}
           />
 
-          {/* 文本编辑覆盖层 */}
-          <TextEditor
-            renderer={renderer}
-            editingElementId={editingTextId}
-            onFinish={() => setEditingTextId(null)}
+          {/* 关键修复：隐藏的文件选择 input，Toolbar 选图片工具时由 useImageUpload 触发 click */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={onFileInputChange}
           />
 
           {/* 当前工具提示 - Figma 风格，不透明背景遮住网格 */}

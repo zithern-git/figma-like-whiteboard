@@ -32,6 +32,14 @@ export function useElementSelection(renderer: CanvasRenderer | null) {
    * 从后往前遍历（上层元素优先），找到第一个命中的元素。
    * Shift 键按下时切换选中状态（多选模式）。
    *
+   * 关键修复（Ctrl+A 后无法整组拖动）：
+   * - 点到已选中的元素 → 保留当前多选，让用户能整组拖动
+   * - 点到未选中的元素 → 单选替换
+   * - 点到空白区：
+   *     - 在所有选中元素整体包围盒内 → 保留选区（用户可拖动整组）
+   *     - 在整体包围盒外 → 取消选区
+   *   （如需无条件清空请按 Esc）
+   *
    * @param e - 鼠标事件
    */
   const handleSelect = useCallback(
@@ -54,17 +62,55 @@ export function useElementSelection(renderer: CanvasRenderer | null) {
           if (e.shiftKey) {
             // Shift + 点击：多选模式
             store.toggleSelected(element.id)
+          } else if (state.selectedIds.has(element.id)) {
+            // 关键修复：点击已选中的元素 → 保留当前多选（用于整组拖动）
+            return
           } else {
-            // 普通点击：单选
+            // 普通点击未选元素：单选
             store.setSelectedIds(new Set([element.id]))
           }
           return
         }
       }
 
-      // 点击空白区域：取消选择
-      if (!e.shiftKey) {
-        store.clearSelection()
+      // 关键修复：点击空白区时，先用 hitTest 探测是不是点在了 8 个缩放手柄或
+      // 旋转手柄上（手柄在 bbox 之外，不被 isPointInElement 捕获）。
+      // 命中手柄 → 保留选区（让 transformStart 能正常处理旋转/缩放）
+      // 没命中手柄 → 走原本的"包围盒外清空"逻辑
+      if (state.selectedIds.size > 0) {
+        // 1. 单选：精确探测手柄（缩放 + 旋转）
+        if (state.selectedIds.size === 1) {
+          const id = Array.from(state.selectedIds)[0]
+          const el = state.elements.find((e) => e.id === id)
+          if (el) {
+            const hit = renderer.hitTest(el, worldPos.x, worldPos.y, true)
+            if (hit.type === 'scale' || hit.type === 'rotate') {
+              return // 命中手柄，保留选区
+            }
+          }
+        }
+        // 2. 包围盒外 → 取消选区
+        let minX = Infinity
+        let minY = Infinity
+        let maxX = -Infinity
+        let maxY = -Infinity
+        for (const el of state.elements) {
+          if (!state.selectedIds.has(el.id)) continue
+          minX = Math.min(minX, el.x)
+          minY = Math.min(minY, el.y)
+          maxX = Math.max(maxX, el.x + (el.width || 0))
+          maxY = Math.max(maxY, el.y + (el.height || 0))
+        }
+        const insideBoundingBox =
+          worldPos.x >= minX &&
+          worldPos.x <= maxX &&
+          worldPos.y >= minY &&
+          worldPos.y <= maxY
+        if (!insideBoundingBox) {
+          // 在整体包围盒外 → 取消选区
+          store.clearSelection()
+        }
+        // 在包围盒内 → 保留选区，不做任何事
       }
     },
     [renderer, store]

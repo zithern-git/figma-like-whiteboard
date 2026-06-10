@@ -22,3 +22,4 @@ export type {
   DirtyRect,
   OffscreenCacheEntry,
 } from './CanvasElement'
+export type { ElementBBox, HitArea } from './CanvasRenderer'

@@ -33,7 +33,7 @@ export interface CanvasElement {
   width: number // 包围盒宽度
   height: number // 包围盒高度
   rotation: number // 旋转角度（弧度，默认 0）
-  opacity: number // 透明度 0-1（默认 1）
+  opacity: number // 透明度（0=完全不透明，1=完全透明，默认 0；与 ctx.globalAlpha 反向）
   fill: string // 填充色（hex 格式，默认 '#000000'）
   stroke: string // 描边色（hex 格式，默认 '#000000'）
   strokeWidth: number // 描边宽度（默认 2）
@@ -41,7 +41,22 @@ export interface CanvasElement {
   text?: string // 文本内容
   fontSize?: number // 字号（默认 16）
   fontFamily?: string // 字体（默认 'Arial'）
+  fontWeight?: 'normal' | 'bold' // 字重（默认 'normal'）
+  fontStyle?: 'normal' | 'italic' // 斜体（默认 'normal'）
+  textAlign?: 'left' | 'center' | 'right' // 水平对齐（默认 'left'）
+  textColor?: string // 文字颜色（默认 '#000000'，优先于 fill）
   imageUrl?: string // 图片 URL
+  /** 关键修复：图片源矩形（裁剪/缩放），单位为图片原始像素
+   *  - sourceX/sourceY：源区域左上角（默认 0,0）
+   *  - sourceWidth/sourceHeight：源区域宽高（默认等于图片原始尺寸）
+   *  通过调整这 4 个字段可以实现任意缩放和裁剪，
+   *  对应 ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) 的 9 参数形式
+   */
+  sourceX?: number
+  sourceY?: number
+  sourceWidth?: number
+  sourceHeight?: number
+  cornerRadius?: number // 矩形圆角半径（像素，默认 0 表示直角矩形）
   version: number // 乐观锁版本号（从 1 开始自增）
   lockUserId?: string // 当前编辑者（乐观锁用）
   createdAt: number // 创建时间戳

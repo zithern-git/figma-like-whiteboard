@@ -308,7 +308,26 @@ export class ShapeRenderer {
       return false // 图片未加载，需要重试
     }
 
-    ctx.drawImage(cachedImage, element.x, element.y, element.width, element.height)
+    // 关键修复：使用 9 参数 ctx.drawImage 支持缩放和裁剪
+    // - 源矩形 (sx, sy, sw, sh) 决定从图片哪个区域取（裁剪）
+    // - 目标矩形 (dx, dy, dw, dh) 决定画到画布哪个位置和大小（缩放）
+    // 缩放：把 sw × sh 区域拉伸/压缩到 dw × dh（element 的包围盒）
+    // 裁剪：调整 sx/sy 把图片"平移"到想要的区域
+    const sx = element.sourceX ?? 0
+    const sy = element.sourceY ?? 0
+    const sw = element.sourceWidth ?? cachedImage.naturalWidth
+    const sh = element.sourceHeight ?? cachedImage.naturalHeight
+    ctx.drawImage(
+      cachedImage,
+      sx,
+      sy,
+      sw,
+      sh,
+      element.x,
+      element.y,
+      element.width,
+      element.height
+    )
     ctx.restore()
     return true
   }

@@ -119,9 +119,12 @@ export default function Canvas({
       e.stopPropagation()
       e.preventDefault()
 
+      // 关键修复：注入 _getRenderer，让 onDoubleClick 可以访问 renderer
+      ;(e as unknown as Record<string, unknown>)._getRenderer = getRenderer
+
       onDoubleClick?.(e)
     },
-    [onDoubleClick]
+    [onDoubleClick, getRenderer]
   )
 
   return (

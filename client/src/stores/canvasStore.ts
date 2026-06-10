@@ -108,6 +108,18 @@ interface CanvasState {
   setStrokeWidth: (width: number) => void
   /** 设置字号 */
   setFontSize: (size: number) => void
+  /** 设置字体 */
+  setFontFamily: (family: string) => void
+  /** 设置字重 */
+  setFontWeight: (weight: 'normal' | 'bold') => void
+  /** 设置斜体 */
+  setFontStyle: (style: 'normal' | 'italic') => void
+  /** 设置文字对齐 */
+  setTextAlign: (align: 'left' | 'center' | 'right') => void
+  /** 设置文字颜色 */
+  setTextColor: (color: string) => void
+  /** 设置默认矩形圆角半径 */
+  setCornerRadius: (radius: number) => void
 
   // ========== 撤销/重做 ==========
   /** 撤销 */
@@ -134,6 +146,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   fillColor: '#FFFFFF',
   strokeWidth: 2,
   fontSize: 16,
+  fontFamily: 'Arial',
+  fontWeight: 'normal',
+  fontStyle: 'normal',
+  textAlign: 'left',
+  textColor: '#000000',
+  cornerRadius: 0,
 
   // ========== 元素操作 ==========
 
@@ -267,14 +285,31 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   duplicateSelected: () => {
     const state = get()
     const selected = state.elements.filter((e) => state.selectedIds.has(e.id))
+    // 关键修复：复制完成后，把新副本设为选中（替换原元素的选中状态）
+    // 这样拖拽移动时只移动副本，原元素保持不动
+    const newIds = new Set<string>()
     selected.forEach((el) => {
+      // 关键修复：pen 和 line 元素的真实位置在 points 中（绝对坐标），
+      // 只偏移 x/y 不偏移 points 会导致副本与原元素位置错乱
+      let newPoints = el.points
+      if ((el.type === 'pen' || el.type === 'line') && el.points) {
+        newPoints = el.points.map((p) => ({ x: p.x + 20, y: p.y + 20 }))
+      }
+      // 关键修复：必须排除 el.id，让 createElement 使用新生成的 nanoid()，
+      // 否则所有副本都会沿用原元素 id，拖拽时 updateElement 只会更新第一个匹配项，
+      // 导致多个副本"塌缩"成一个
+      const { id: _ignored, ...rest } = el
       const copy = state.createElement(el.type, {
-        ...el,
+        ...rest,
         x: el.x + 20,
         y: el.y + 20,
+        points: newPoints,
       })
       state.addElement(copy)
+      newIds.add(copy.id)
     })
+    // 关键修复：把 selectedIds 改为只包含新副本
+    set({ selectedIds: newIds })
   },
 
   // ========== 工具与视口 ==========
@@ -293,6 +328,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   setFillColor: (color: string) => set({ fillColor: color }),
   setStrokeWidth: (width: number) => set({ strokeWidth: width }),
   setFontSize: (size: number) => set({ fontSize: size }),
+  setFontFamily: (family: string) => set({ fontFamily: family }),
+  setFontWeight: (weight: 'normal' | 'bold') => set({ fontWeight: weight }),
+  setFontStyle: (style: 'normal' | 'italic') => set({ fontStyle: style }),
+  setTextAlign: (align: 'left' | 'center' | 'right') => set({ textAlign: align }),
+  setTextColor: (color: string) => set({ textColor: color }),
+  setCornerRadius: (radius: number) => set({ cornerRadius: Math.max(0, radius) }),
 
   // ========== 撤销/重做 ==========
 
@@ -336,10 +377,21 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       width: 100,
       height: 100,
       rotation: 0,
-      opacity: 1,
+      // 关键修复：透明度语义反转后，默认值改为 0（完全不透明），
+      // 而不是旧的 1（在新语义下会变成完全透明）
+      opacity: 0,
       fill: get().fillColor,
       stroke: get().strokeColor,
       strokeWidth: get().strokeWidth,
+      // 矩形默认带当前 store 中的圆角半径；非矩形类型会被 overrides 覆盖或忽略
+      cornerRadius: type === 'rect' ? get().cornerRadius : undefined,
+      // 关键修复：文本元素默认带 store 中的文字样式
+      fontSize: type === 'text' ? get().fontSize : undefined,
+      fontFamily: type === 'text' ? get().fontFamily : undefined,
+      fontWeight: type === 'text' ? get().fontWeight : undefined,
+      fontStyle: type === 'text' ? get().fontStyle : undefined,
+      textAlign: type === 'text' ? get().textAlign : undefined,
+      textColor: type === 'text' ? get().textColor : undefined,
       version: 1,
       createdAt: Date.now(),
       updatedAt: Date.now(),
