@@ -4,13 +4,20 @@ import { createServer } from 'http'
 import { errorHandler } from './middleware/errorHandler'
 import authRoutes from './routes/authRoutes'
 import whiteboardRoutes from './routes/whiteboardRoutes'
+import snapshotRoutes from './routes/snapshotRoutes'
 import { initializeSocket } from './sockets'
 
 const app = express()
 const httpServer = createServer(app)
 
-// 初始化 Socket.IO（统一在 sockets 模块中创建 + 注册 handler）
+// 异步初始化 Socket.IO（挂载 Redis Adapter）
+// 注意：initializeSocket 是 async，但这里不能 await（module 同步求值）
+// 实际等待放在 index.ts 的 start() 流程里
 initializeSocket(httpServer)
+  .then(() => console.log('[Socket.IO] initialization completed'))
+  .catch((err) =>
+    console.error('[Socket.IO] initialization failed:', err)
+  )
 
 app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:5173',
@@ -25,6 +32,7 @@ app.get('/api/health', (_req, res) => {
 
 app.use('/api/auth', authRoutes)
 app.use('/api/whiteboards', whiteboardRoutes)
+app.use('/api/whiteboards', snapshotRoutes)
 
 // 404 handler
 app.use((_req, res) => {
