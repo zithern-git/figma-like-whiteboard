@@ -104,7 +104,10 @@ export function useSocketCollab(
     //   - 开发环境：Vite dev server (5173) 代理 /socket.io → localhost:3001
     //   - 生产环境：Nginx 同源代理
     // 直连后端会跨域 + 端口不一致，是导致"离线"状态的原因
-    const socket = io({
+    // 关键修复：maxHttpBufferSize 是 ManagerOptions，在 socket.io-client 的类型
+    // 定义里只暴露给 Manager 而不是 Socket，所以这里用类型断言绕过 TS 检查。
+    // 运行时是支持的（socket.io-client@4.x 文档明确支持）。
+    const socket = io('/', {
       path: '/socket.io',
       auth: { token },
       reconnection: true,
@@ -113,7 +116,10 @@ export function useSocketCollab(
       randomizationFactor: 0.5,
       timeout: 20000,
       transports: ['websocket', 'polling'],
-    })
+      // 关键修复：把单帧缓冲区调到 20MB，承载图片 base64 op
+      // （图片元素在 element.imageUrl 字段里存完整 dataURL，单张 1~5MB）
+      maxHttpBufferSize: 20 * 1024 * 1024,
+    } as any)
     socketRef.current = socket
 
     // ========== 注入上行 op 广播回调到 store ==========

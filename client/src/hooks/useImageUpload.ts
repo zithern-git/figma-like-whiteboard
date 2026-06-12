@@ -16,8 +16,11 @@ import { useCallback, useRef } from "react";
 import { CanvasRenderer } from "@/canvas/CanvasRenderer";
 import { useCanvasStore } from "@/stores/canvasStore";
 
-/** 图片最大显示尺寸（保持宽高比） */
-const MAX_IMAGE_DIMENSION = 800;
+/** 图片最大显示尺寸（保持宽高比）
+ * 关键修复：800 → 600。base64 dataURL 长度 ≈ 4/3 × (W × H × 4) 字节。
+ * 600×600 图大约 1.1MB，加上 Socket.IO 帧头在 20MB 缓冲区内安全。
+ */
+const MAX_IMAGE_DIMENSION = 600;
 
 export function useImageUpload(renderer: CanvasRenderer | null) {
   /** 隐藏的文件选择 input 引用 */

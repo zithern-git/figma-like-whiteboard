@@ -199,6 +199,11 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         elements: s.elements.map((e) => (e.id === element.id ? element : e)),
       })),
     _setElementsRaw: (elements) => set({ elements }),
+    /**
+     * 关键修复：Command 通过此回调把 op 广播到服务端。
+     * execute / undo / redo 都会调用，保证撤销/重做也能同步给其他用户。
+     */
+    _broadcastOp: (op) => broadcastOp(op),
   }
 
   // ========== 协作 op 上行回调（由 useSocketCollab 注入） ==========
@@ -224,40 +229,21 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     cornerRadius: 0,
 
     // ========== 元素操作（走 UndoManager + 上行广播） ==========
+    // 关键修复：广播由 Command 的 execute/undo/redo 自己负责，调用方不再手写 broadcastOp。
+    // 这样撤销/重做也能自动同步到服务端（修复"刷新后撤销失效"的 bug）。
 
     addElement: (element) => {
-      const clientOpId = nanoid()
       undoManager.execute(new AddElementCommand(self, element))
-      broadcastOp({
-        clientOpId,
-        opType: 'add',
-        payload: { element },
-        timestamp: Date.now(),
-      })
     },
 
     deleteElement: (id) => {
       const element = get().elements.find((e) => e.id === id)
       if (!element) return
-      const clientOpId = nanoid()
       undoManager.execute(new DeleteElementCommand(self, element))
-      broadcastOp({
-        clientOpId,
-        opType: 'delete',
-        payload: { id },
-        timestamp: Date.now(),
-      })
     },
 
     updateElement: (id, updates) => {
-      const clientOpId = nanoid()
       undoManager.execute(new UpdateElementCommand(self, id, updates))
-      broadcastOp({
-        clientOpId,
-        opType: 'update',
-        payload: { id, updates },
-        timestamp: Date.now(),
-      })
     },
 
     /**
@@ -271,16 +257,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     },
 
     clearAllElements: () => {
-      const clientOpId = nanoid()
       undoManager.execute(
         new ClearAllElementsCommand(self, get().elements)
       )
-      broadcastOp({
-        clientOpId,
-        opType: 'clear-all',
-        payload: {},
-        timestamp: Date.now(),
-      })
     },
 
     // ========== 选择操作 ==========
@@ -312,7 +291,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     /**
      * 删除所有选中元素：合并为单次 undo（一步还原全部）。
      * 同时从 selectedIds 移除已删除项。
-     * 每个删除操作都广播一个独立 op（去重由 clientOpId 保证）。
+     * 每个删除操作由 Command 内部广播独立 op。
      */
     deleteSelectedElements: () => {
       const state = get()
@@ -322,14 +301,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       for (const id of ids) {
         const el = state.elements.find((e) => e.id === id)
         if (!el) continue
-        const clientOpId = nanoid()
         undoManager.execute(new DeleteElementCommand(self, el))
-        broadcastOp({
-          clientOpId,
-          opType: 'delete',
-          payload: { id },
-          timestamp: Date.now(),
-        })
       }
       undoManager.endBatch()
       set({ selectedIds: new Set() })
@@ -338,7 +310,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     /**
      * 复制选中元素：合并为单次 undo（Ctrl+Z 一次删除全部副本）。
      * 复制后选区替换为新副本。
-     * 每个副本广播一个独立 add op。
+     * 每个副本由 Command 内部广播独立 add op。
      */
     duplicateSelected: () => {
       const state = get()
@@ -362,14 +334,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           y: el.y + 20,
           points: newPoints,
         })
-        const clientOpId = nanoid()
         undoManager.execute(new AddElementCommand(self, copy))
-        broadcastOp({
-          clientOpId,
-          opType: 'add',
-          payload: { element: copy },
-          timestamp: Date.now(),
-        })
         newIds.add(copy.id)
       })
       undoManager.endBatch()
@@ -428,8 +393,20 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
      * - update:     _replaceElementRaw
      * - delete:     _removeElementRaw
      * - clear-all:  _setElementsRaw([])
+     *
+     * 关键设计：忽略 serverElements 字段（即使服务端传过来），只用 op 本身
+     * 增量更新本地。原因：
+     *   - 6.1 是 last-write-wins，服务端每次 op 都会带上 serverElements（最新持久化状态）
+     *   - 如果客户端收到 op 就用 serverElements 整张替换本地，会**抹掉本地未提交的
+     *     操作**。例：A 在画矩形的同时 B 在删除 A 已选中的元素，A 收到 B 的 delete
+     *     op，serverElements 不含 A 正在画的矩形 → A 的矩形被抹掉 → 双方画布漂移。
+     *   - 正确的同步语义是：本地操作按到达顺序逐个 apply，不需要整张对齐。
+     *   - 整张对齐只在初次加入白板时用一次（join-whiteboard-ack → setElements）。
+     *
+     * 丢 op 防御：服务端原子写入后必定广播；Socket.IO 同一 room 内保证有序；
+     * 丢 op 情况下允许短期漂移，由用户刷新页面（join-whiteboard-ack）重新对齐。
      */
-    _applyRemoteOp: (op) => {
+    _applyRemoteOp: (op: ServerOp) => {
       switch (op.opType) {
         case 'add': {
           const el = op.payload?.element

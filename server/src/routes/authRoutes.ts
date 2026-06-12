@@ -9,7 +9,8 @@ const router = Router()
 
 const generateToken = (userId: string, email: string): string => {
   const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production'
-  return jwt.sign({ userId, email }, secret, { expiresIn: '7d' })
+  const expiresIn = process.env.JWT_EXPIRES_IN || '30d'
+  return jwt.sign({ userId, email }, secret, { expiresIn: expiresIn as jwt.SignOptions['expiresIn'] })
 }
 
 router.post(
@@ -28,8 +29,8 @@ router.post(
         res.status(409).json({
           success: false,
           error: {
-            code: 'CONFLICT',
-            message: 'Email already registered',
+            code: 'EMAIL_TAKEN',
+            message: '该邮箱已注册，请直接登录',
           },
         })
         return

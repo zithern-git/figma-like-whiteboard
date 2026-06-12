@@ -15,6 +15,7 @@
  */
 
 import { Server, Socket } from 'socket.io'
+import mongoose from 'mongoose'
 import Whiteboard from '../models/Whiteboard'
 import {
   ElementOpPayload,
@@ -66,21 +67,34 @@ export function registerWhiteboardHandlers(io: Server, socket: Socket): void {
   // ========== join-whiteboard ==========
   socket.on('join-whiteboard', async (payload: JoinPayload) => {
     try {
-      const { whiteboardId: shortId } = payload
-      if (!shortId) {
+      // 客户端可能传 shortId（6位 nanoid）或 mongo _id（来自 URL /whiteboard/:id）
+      // 两种都支持：用 $or 同时查
+      const { whiteboardId: id } = payload
+      if (!id) {
         socket.emit('error', { code: 'BAD_REQUEST', message: 'whiteboardId required' })
         return
       }
 
-      // 查白板
-      const whiteboard = await Whiteboard.findOne({ shortId })
-      if (!whiteboard || whiteboard.deleted) {
+      // 查白板：支持 shortId 或 mongo _id
+      const orConditions: any[] = [{ shortId: id }]
+      if (mongoose.isValidObjectId(id)) {
+        orConditions.push({ _id: id })
+      }
+      const whiteboard = await Whiteboard.findOne({
+        deleted: false,
+        $or: orConditions,
+      })
+      if (!whiteboard) {
         socket.emit('error', {
           code: 'NOT_FOUND',
           message: 'Whiteboard not found',
         })
         return
       }
+
+      // 关键：用文档里实际的 shortId（标准化）作为 room key 和 joinedRooms
+      // 这样不管客户端传 shortId 还是 _id，房间命名都一致
+      const shortId = whiteboard.shortId
 
       // 权限
       if (!canAccess(whiteboard, userId)) {
@@ -139,6 +153,13 @@ export function registerWhiteboardHandlers(io: Server, socket: Socket): void {
         })
         return
       }
+
+      // 关键修复：打印 op 大小和类型，便于诊断图片上传失败 / 缓冲区溢出
+      const opSize = JSON.stringify(op).length
+      const payloadKb = (opSize / 1024).toFixed(1)
+      console.log(
+        `[element-op] user=${userId} shortId=${shortId} opType=${op.opType} payload=${payloadKb}KB clientOpId=${op.clientOpId}`
+      )
 
       const result = await handleElementOp(io, socket, shortId, userId, op)
       if (!result.allowed) {

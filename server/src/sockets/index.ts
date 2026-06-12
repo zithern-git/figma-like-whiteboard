@@ -13,6 +13,9 @@ export const initializeSocket = (server: HttpServer): Server => {
       methods: ['GET', 'POST'],
       credentials: true,
     },
+    // 关键修复：图片以 base64 dataURL 存储在 element 中，单张图可能 1~5MB，
+    // 默认 1MB 缓冲区会被 Socket.IO 静默丢弃。调到 20MB 兜底。
+    maxHttpBufferSize: 20 * 1024 * 1024,
   })
 
   // ========== JWT 认证中间件 ==========

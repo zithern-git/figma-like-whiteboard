@@ -51,27 +51,28 @@ export class UndoManager {
     cmd.execute()
 
     // 2. 决定压栈位置
-    if (cmd.batchId) {
-      if (this.currentBatchId === cmd.batchId) {
-        // 同 batch：尝试与最后一条 UpdateElementCommand 合并
-        const last = this.currentBatchCmds[this.currentBatchCmds.length - 1]
-        if (
-          cmd instanceof UpdateElementCommand &&
-          last instanceof UpdateElementCommand &&
-          cmd.mergeInto(last)
-        ) {
-          // 合并成功：不追加新命令
-        } else {
-          this.currentBatchCmds.push(cmd)
-        }
+    if (cmd.batchId && cmd.batchId === this.currentBatchId) {
+      // 同 batch：尝试与已有同元素 UpdateElementCommand 合并
+      if (this.tryMergeUpdateIntoCurrentBatch(cmd)) {
+        // 合并成功
       } else {
-        // 新 batch 启动：先提交上一个 batch
-        this.finalizeBatch()
-        this.currentBatchId = cmd.batchId
-        this.currentBatchCmds = [cmd]
+        this.currentBatchCmds.push(cmd)
+      }
+    } else if (cmd.batchId) {
+      // 新 batch 启动：先提交上一个 batch
+      this.finalizeBatch()
+      this.currentBatchId = cmd.batchId
+      this.currentBatchCmds = [cmd]
+    } else if (this.currentBatchId !== null) {
+      // 关键修复 1：beginUndoBatch 之后、cmd.batchId 为空的命令也加入当前 batch
+      // 解决 useElementTransform 拖拽时 updateElement 不带 batchId 导致 N 条独立 undo
+      if (this.tryMergeUpdateIntoCurrentBatch(cmd)) {
+        // 合并成功
+      } else {
+        this.currentBatchCmds.push(cmd)
       }
     } else {
-      // 非 batch 命令：先提交上一个 batch
+      // 非 batch 命令：先提交上一个 batch（如果有未结束的）
       this.finalizeBatch()
       this.push(cmd)
     }
@@ -185,5 +186,31 @@ export class UndoManager {
     if (this.undoStack.length > UNDO_STACK_LIMIT) {
       this.undoStack.shift()
     }
+  }
+
+  /**
+   * 关键修复 2：把 UpdateElementCommand 合并入当前 batch 内已有的同元素 UpdateElementCommand
+   * - 遍历整个 currentBatchCmds（不仅最后一条），解决多选拖拽时 merge 漏掉
+   * - 委托给 cmd.mergeInto(existing)：
+   *     cmd（更新的）覆盖 existing（更早的）的 newSnapshot，
+   *     但保留 existing 的 oldSnapshot（原始位置）
+   * - 仅 UpdateElementCommand 可合并；其他命令直接追加
+   * - 返回 true 表示已合并（调用方不应再 push）
+   */
+  private tryMergeUpdateIntoCurrentBatch(cmd: Command): boolean {
+    if (!(cmd instanceof UpdateElementCommand)) return false
+    for (let i = this.currentBatchCmds.length - 1; i >= 0; i--) {
+      const existing = this.currentBatchCmds[i]
+      if (
+        existing instanceof UpdateElementCommand &&
+        existing.targetId === cmd.targetId
+      ) {
+        // cmd 是更晚到达的（更新位置），existing 是更早的（记录了原始位置）
+        // 把 cmd 的 newSnapshot 写入 existing，让 existing 一次性还原到原始位置
+        cmd.mergeInto(existing)
+        return true
+      }
+    }
+    return false
   }
 }
