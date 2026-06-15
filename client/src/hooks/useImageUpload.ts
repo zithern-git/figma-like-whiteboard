@@ -10,17 +10,30 @@
  *
  * 选中的图片经过 FileReader.readAsDataURL 转成 base64，
  * 按图片原始宽高创建 image 元素（过大时自动按比例缩小到 800x600 边界内）。
+ *
+ * 边界情况处理：
+ * - 超大图片（>10MB）：前端用 OffscreenCanvas / Canvas 重新绘制为 JPEG 压缩
+ *   - 避免 base64 序列化后帧大小超限（Socket.IO 单帧 20MB）
+ *   - 避免过大的 dataURL 占用 localStorage / IndexedDB
+ * - 自动旋转（EXIF）：TODO 暂不处理
  */
 
 import { useCallback, useRef } from "react";
 import { CanvasRenderer } from "@/canvas/CanvasRenderer";
 import { useCanvasStore } from "@/stores/canvasStore";
+import { toast } from "@/stores/toastStore";
 
 /** 图片最大显示尺寸（保持宽高比）
  * 关键修复：800 → 600。base64 dataURL 长度 ≈ 4/3 × (W × H × 4) 字节。
  * 600×600 图大约 1.1MB，加上 Socket.IO 帧头在 20MB 缓冲区内安全。
  */
 const MAX_IMAGE_DIMENSION = 600;
+
+/** 触发前端压缩的文件大小阈值（10MB） */
+const COMPRESS_THRESHOLD_BYTES = 10 * 1024 * 1024;
+
+/** JPEG 压缩质量（0~1） */
+const COMPRESS_QUALITY = 0.85;
 
 export function useImageUpload(renderer: CanvasRenderer | null) {
   /** 隐藏的文件选择 input 引用 */
@@ -37,19 +50,24 @@ export function useImageUpload(renderer: CanvasRenderer | null) {
   const handleFile = useCallback(
     (file: File, worldPos?: { x: number; y: number }) => {
       if (!file.type.startsWith("image/")) {
-        console.warn("[useImageUpload] 不是图片文件:", file.type);
+        toast.warning("请选择图片文件");
         return;
       }
 
+      // 关键修复：超大图片（>10MB）走前端压缩路径
+      // 1. FileReader 读出 dataURL
+      // 2. 用 Image 解码
+      // 3. 用 OffscreenCanvas / Canvas 重绘为 JPEG（dataURL 体积大幅下降）
+      // 4. 转回 dataURL 后再走 addElement
       const reader = new FileReader();
       reader.onload = (ev) => {
         const dataUrl = ev.target?.result as string;
         if (!dataUrl) return;
 
-        // 用 HTMLImageElement 读取图片原始宽高
         const probe = new Image();
         probe.onload = () => {
           const state = useCanvasStore.getState();
+
           // 等比缩放到 MAX_IMAGE_DIMENSION 之内
           let w = probe.naturalWidth;
           let h = probe.naturalHeight;
@@ -62,34 +80,30 @@ export function useImageUpload(renderer: CanvasRenderer | null) {
             h = Math.round(h * scale);
           }
 
-          // 计算放置位置：优先用传入的 worldPos，其次用视口中心
-          let posX = 0;
-          let posY = 0;
-          if (worldPos) {
-            posX = worldPos.x;
-            posY = worldPos.y;
-          } else if (renderer) {
-            const v = renderer.getViewport();
-            // 视口中心对应的世界坐标
-            const canvas = (renderer as any).mainCanvas as HTMLCanvasElement | undefined;
-            const cw = canvas ? canvas.clientWidth : window.innerWidth;
-            const ch = canvas ? canvas.clientHeight : window.innerHeight;
-            posX = (cw / 2 - v.translateX) / v.zoom - w / 2;
-            posY = (ch / 2 - v.translateY) / v.zoom - h / 2;
+          // 关键修复：>10MB 文件触发压缩走重绘流程
+          // 重绘为 JPEG 后，base64 体积通常下降 70%+
+          if (file.size > COMPRESS_THRESHOLD_BYTES) {
+            compressImage(dataUrl, w, h)
+              .then((compressedDataUrl) => {
+                addImageElement(state, compressedDataUrl, w, h, worldPos, renderer, file);
+              })
+              .catch((err) => {
+                console.error("[useImageUpload] 压缩失败:", err);
+                toast.error("图片压缩失败，使用原图");
+                addImageElement(state, dataUrl, w, h, worldPos, renderer, file);
+              });
+            return;
           }
 
-          const imageEl = state.createElement("image", {
-            x: posX,
-            y: posY,
-            width: w,
-            height: h,
-            imageUrl: dataUrl,
-          });
-          state.addElement(imageEl);
-          // 创建后自动选中新图片
-          state.setSelectedIds(new Set([imageEl.id]));
+          addImageElement(state, dataUrl, w, h, worldPos, renderer, file);
+        };
+        probe.onerror = () => {
+          toast.error("图片加载失败");
         };
         probe.src = dataUrl;
+      };
+      reader.onerror = () => {
+        toast.error("文件读取失败");
       };
       reader.readAsDataURL(file);
     },
@@ -180,4 +194,102 @@ export function useImageUpload(renderer: CanvasRenderer | null) {
     onDrop,
     onPaste,
   };
+}
+
+/**
+ * 压缩图片为 JPEG dataURL
+ *
+ * 用 Canvas 重新绘制图片并以 JPEG 格式导出，大幅减少 base64 体积。
+ * 优先使用 OffscreenCanvas（性能更好），fallback 到普通 Canvas。
+ */
+async function compressImage(
+  dataUrl: string,
+  width: number,
+  height: number
+): Promise<string> {
+  const img = new Image();
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("Image load failed"));
+    img.src = dataUrl;
+  });
+
+  // 优先用 OffscreenCanvas（worker 友好，性能更好）
+  const useOffscreen =
+    typeof OffscreenCanvas !== "undefined" &&
+    typeof (OffscreenCanvas.prototype as unknown as { convertToBlob?: unknown }).convertToBlob === "function";
+
+  if (useOffscreen) {
+    const off = new OffscreenCanvas(width, height);
+    const ctx = off.getContext("2d");
+    if (!ctx) throw new Error("OffscreenCanvas 2d context unavailable");
+    ctx.drawImage(img, 0, 0, width, height);
+    // convertToBlob 在标准 lib.dom 里可用，但 TS 严格模式可能不识别，用类型断言
+    const blob = await (off as unknown as {
+      convertToBlob: (opts: { type: string; quality: number }) => Promise<Blob>;
+    }).convertToBlob({ type: "image/jpeg", quality: COMPRESS_QUALITY });
+    return await blobToDataURL(blob);
+  }
+
+  // Fallback：普通 Canvas
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas 2d context unavailable");
+  ctx.drawImage(img, 0, 0, width, height);
+  return canvas.toDataURL("image/jpeg", COMPRESS_QUALITY);
+}
+
+/** Blob → dataURL（仅 OffscreenCanvas 路径需要，普通 Canvas 走 toDataURL 一步到位） */
+function blobToDataURL(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error("Blob read failed"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+/** 把图片元素加到画布（供压缩 / 非压缩两个分支共用） */
+function addImageElement(
+  state: ReturnType<typeof useCanvasStore.getState>,
+  dataUrl: string,
+  w: number,
+  h: number,
+  worldPos: { x: number; y: number } | undefined,
+  renderer: CanvasRenderer | null,
+  file: File
+) {
+  // 计算放置位置：优先用传入的 worldPos，其次用视口中心
+  let posX = 0;
+  let posY = 0;
+  if (worldPos) {
+    posX = worldPos.x;
+    posY = worldPos.y;
+  } else if (renderer) {
+    const v = renderer.getViewport();
+    // 通过 renderer 暴露的 mainCanvas（私有字段）取得容器尺寸
+    const mainCanvas = (renderer as unknown as { mainCanvas?: HTMLCanvasElement }).mainCanvas;
+    const cw = mainCanvas ? mainCanvas.clientWidth : window.innerWidth;
+    const ch = mainCanvas ? mainCanvas.clientHeight : window.innerHeight;
+    posX = (cw / 2 - v.translateX) / v.zoom - w / 2;
+    posY = (ch / 2 - v.translateY) / v.zoom - h / 2;
+  }
+
+  const imageEl = state.createElement("image", {
+    x: posX,
+    y: posY,
+    width: w,
+    height: h,
+    imageUrl: dataUrl,
+  });
+  state.addElement(imageEl);
+  // 创建后自动选中新图片
+  state.setSelectedIds(new Set([imageEl.id]));
+
+  // 用户反馈：文件越大提示越明显
+  if (file.size > COMPRESS_THRESHOLD_BYTES) {
+    toast.success(`已添加图片（${(file.size / 1024 / 1024).toFixed(1)}MB，已自动压缩）`);
+  }
 }

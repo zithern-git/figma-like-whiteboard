@@ -31,6 +31,11 @@ export class InMemoryRedisAdapter {
     return 'OK'
   }
 
+  async setEx(key: string, seconds: number, value: string): Promise<string> {
+    this.store.set(key, value)
+    return 'OK'
+  }
+
   async del(...keys: string[]): Promise<number> {
     let count = 0
     keys.forEach((k) => {
@@ -42,7 +47,7 @@ export class InMemoryRedisAdapter {
     return count
   }
 
-  async sadd(key: string, ...members: string[]): Promise<number> {
+  async sAdd(key: string, ...members: string[]): Promise<number> {
     const set = (this.store.get(key) as Set<string>) || new Set<string>()
     let added = 0
     members.forEach((m) => {
@@ -55,7 +60,7 @@ export class InMemoryRedisAdapter {
     return added
   }
 
-  async srem(key: string, ...members: string[]): Promise<number> {
+  async sRem(key: string, ...members: string[]): Promise<number> {
     const set = this.store.get(key) as Set<string>
     if (!set) return 0
     let removed = 0
@@ -68,12 +73,12 @@ export class InMemoryRedisAdapter {
     return removed
   }
 
-  async smembers(key: string): Promise<string[]> {
+  async sMembers(key: string): Promise<string[]> {
     const set = this.store.get(key) as Set<string>
     return set ? Array.from(set) : []
   }
 
-  async scard(key: string): Promise<number> {
+  async sCard(key: string): Promise<number> {
     const set = this.store.get(key) as Set<string>
     return set ? set.size : 0
   }
@@ -88,6 +93,14 @@ export class InMemoryRedisAdapter {
 
   async subscribe(): Promise<void> {
     /* no-op */
+  }
+
+  async unsubscribe(): Promise<void> {
+    /* no-op */
+  }
+
+  get isOpen(): boolean {
+    return true
   }
 }
 
@@ -164,6 +177,18 @@ export async function closeRedis(): Promise<void> {
     pubClient.isOpen ? pubClient.quit() : Promise.resolve(),
     subClient.isOpen ? subClient.quit() : Promise.resolve(),
   ])
+}
+
+/** 获取当前实际可用的 Redis 客户端（真实 Redis 或内存降级） */
+let activeRedisClient: RedisClientType | InMemoryRedisAdapter | null = null
+export function setActiveRedisClient(client: RedisClientType | InMemoryRedisAdapter): void {
+  activeRedisClient = client
+}
+export function getActiveRedisClient(): RedisClientType | InMemoryRedisAdapter {
+  if (!activeRedisClient) {
+    throw new Error('Redis client not initialized. Call initRedis() first.')
+  }
+  return activeRedisClient
 }
 
 // 保留旧名导出（兼容 onlineUsers.ts 旧引用）

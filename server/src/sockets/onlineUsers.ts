@@ -11,7 +11,7 @@
  * 6.2 阶段如果有需要再升级为 Hash。
  */
 
-import redisClient from '../config/redis'
+import { getActiveRedisClient } from '../config/redis'
 
 /** 在线用户展示信息 */
 export interface OnlineUserInfo {
@@ -40,7 +40,8 @@ export function getUserColor(userId: string): string {
 
 /** 读所有用户信息（解析 JSON） */
 async function readUsersJson(shortId: string): Promise<OnlineUserInfo[]> {
-  const raw = await redisClient.get(USERS_JSON_KEY(shortId))
+  const redis = getActiveRedisClient()
+  const raw = await redis.get(USERS_JSON_KEY(shortId))
   if (!raw) return []
   try {
     return JSON.parse(raw) as OnlineUserInfo[]
@@ -54,7 +55,8 @@ async function writeUsersJson(
   shortId: string,
   users: OnlineUserInfo[]
 ): Promise<void> {
-  await redisClient.set(USERS_JSON_KEY(shortId), JSON.stringify(users))
+  const redis = getActiveRedisClient()
+  await redis.set(USERS_JSON_KEY(shortId), JSON.stringify(users))
 }
 
 /**
@@ -69,7 +71,8 @@ export async function joinOnline(
   name: string,
   socketId: string
 ): Promise<OnlineUserInfo[]> {
-  await redisClient.sAdd(ONLINE_SET_KEY(shortId), userId)
+  const redis = getActiveRedisClient()
+  await redis.sAdd(ONLINE_SET_KEY(shortId), userId)
   const users = await readUsersJson(shortId)
   const existing = users.find((u) => u.userId === userId)
   if (existing) {
@@ -96,12 +99,13 @@ export async function leaveOnline(
   shortId: string,
   socketId: string
 ): Promise<OnlineUserInfo[]> {
+  const redis = getActiveRedisClient()
   const users = await readUsersJson(shortId)
   const idx = users.findIndex((u) => u.socketId === socketId)
   if (idx === -1) return users
   const removed = users.splice(idx, 1)[0]
   await writeUsersJson(shortId, users)
-  await redisClient.sRem(ONLINE_SET_KEY(shortId), removed.userId)
+  await redis.sRem(ONLINE_SET_KEY(shortId), removed.userId)
   return users
 }
 
@@ -112,6 +116,7 @@ export async function listOnline(shortId: string): Promise<OnlineUserInfo[]> {
 
 /** 清理白板（白板删除时使用） */
 export async function clearOnline(shortId: string): Promise<void> {
-  await redisClient.del(ONLINE_SET_KEY(shortId))
-  await redisClient.del(USERS_JSON_KEY(shortId))
+  const redis = getActiveRedisClient()
+  await redis.del(ONLINE_SET_KEY(shortId))
+  await redis.del(USERS_JSON_KEY(shortId))
 }

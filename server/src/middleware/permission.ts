@@ -1,62 +1,59 @@
+/**
+ * 角色权限中间件 (requireRole)
+ *
+ * 关键修复（Phase 7）：
+ * - 失败通过 next(err) 走统一 errorHandler
+ * - 使用 AppError(AUTH_ERROR / NOT_FOUND / FORBIDDEN) 走统一格式
+ */
+
 import { Request, Response, NextFunction } from 'express'
+import mongoose from 'mongoose'
 import Whiteboard from '../models/Whiteboard'
+import { AppError, asyncHandler } from './errorHandler'
 
 export type Role = 'owner' | 'editor' | 'viewer'
 
 export const requireRole = (...roles: Role[]) => {
-  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const whiteboardId = req.params.id
-      const userId = req.user?.userId
+  return asyncHandler(async (req: Request, _res: Response, next: NextFunction) => {
+    const whiteboardId = req.params.id
+    const userId = req.user?.userId
 
-      if (!userId) {
-        res.status(401).json({
-          success: false,
-          error: { code: 'AUTH_ERROR', message: 'Authentication required' },
-        })
-        return
-      }
-
-      const whiteboard = await Whiteboard.findById(whiteboardId)
-
-      if (!whiteboard) {
-        res.status(404).json({
-          success: false,
-          error: { code: 'NOT_FOUND', message: 'Whiteboard not found' },
-        })
-        return
-      }
-
-      if (whiteboard.ownerId === userId) {
-        return next()
-      }
-
-      const collaborator = whiteboard.collaborators.find(
-        (c: { userId: string; role: string }) => c.userId === userId
-      )
-
-      if (!collaborator) {
-        res.status(403).json({
-          success: false,
-          error: { code: 'FORBIDDEN', message: 'Access denied' },
-        })
-        return
-      }
-
-      if (!roles.includes(collaborator.role as Role)) {
-        res.status(403).json({
-          success: false,
-          error: {
-            code: 'FORBIDDEN',
-            message: `Requires ${roles.join(' or ')} role`,
-          },
-        })
-        return
-      }
-
-      next()
-    } catch (error) {
-      next(error)
+    if (!userId) {
+      throw new AppError('AUTH_ERROR', 'Authentication required', 401)
     }
-  }
+
+    // 关键修复：先校验 ID 格式，避免 CastError 走默认 500
+    let whiteboard
+    if (mongoose.isValidObjectId(whiteboardId)) {
+      whiteboard = await Whiteboard.findById(whiteboardId)
+    } else {
+      whiteboard = await Whiteboard.findOne({ shortId: whiteboardId })
+    }
+
+    if (!whiteboard || whiteboard.deleted) {
+      throw new AppError('NOT_FOUND', 'Whiteboard not found', 404)
+    }
+
+    if (whiteboard.ownerId === userId) {
+      return next()
+    }
+
+    const collaborator = whiteboard.collaborators.find(
+      (c: { userId: string; role: string }) => c.userId === userId
+    )
+
+    if (!collaborator) {
+      throw new AppError('FORBIDDEN', 'Access denied', 403)
+    }
+
+    if (!roles.includes(collaborator.role as Role)) {
+      throw new AppError(
+        'FORBIDDEN',
+        `Requires ${roles.join(' or ')} role`,
+        403
+      )
+    }
+
+    next()
+  })
 }

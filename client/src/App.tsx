@@ -6,6 +6,8 @@ import RegisterPage from '@/features/auth/RegisterPage'
 import WhiteboardListPage from '@/features/whiteboard/WhiteboardListPage'
 import WhiteboardPage from '@/features/whiteboard/WhiteboardPage'
 import ProtectedRoute from '@/components/ui/ProtectedRoute'
+import ErrorBoundary from '@/components/ui/ErrorBoundary'
+import ToastContainer from '@/components/ui/Toast'
 
 function AppContent() {
   const initialize = useAuthStore((s) => s.initialize)
@@ -41,9 +43,13 @@ function AppContent() {
 
 function App() {
   return (
-    <BrowserRouter>
-      <AppContent />
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <AppContent />
+      </BrowserRouter>
+      {/* 全局 Toast 容器，固定挂载在根节点 */}
+      <ToastContainer />
+    </ErrorBoundary>
   )
 }
 

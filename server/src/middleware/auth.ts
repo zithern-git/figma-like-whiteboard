@@ -1,5 +1,14 @@
+/**
+ * JWT 认证中间件 (auth)
+ *
+ * 关键修复（Phase 7）：
+ * - 失败通过 next(err) 走统一 errorHandler（不再 res.json 直返）
+ * - 使用 AppError('AUTH_ERROR', ...) 走统一格式
+ */
+
 import { Request, Response, NextFunction } from 'express'
 import jwt from 'jsonwebtoken'
+import { AppError } from './errorHandler'
 
 interface JwtPayload {
   userId: string
@@ -14,18 +23,11 @@ declare global {
   }
 }
 
-export const auth = (req: Request, res: Response, next: NextFunction): void => {
+export const auth = (req: Request, _res: Response, next: NextFunction): void => {
   const authHeader = req.headers.authorization
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({
-      success: false,
-      error: {
-        code: 'AUTH_ERROR',
-        message: 'Authentication required',
-      },
-    })
-    return
+    return next(new AppError('AUTH_ERROR', 'Authentication required', 401))
   }
 
   const token = authHeader.split(' ')[1]
@@ -36,12 +38,6 @@ export const auth = (req: Request, res: Response, next: NextFunction): void => {
     req.user = decoded
     next()
   } catch {
-    res.status(401).json({
-      success: false,
-      error: {
-        code: 'AUTH_ERROR',
-        message: 'Invalid or expired token',
-      },
-    })
+    next(new AppError('AUTH_ERROR', 'Invalid or expired token', 401))
   }
 }

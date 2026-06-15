@@ -474,3 +474,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     },
   }
 })
+
+// 关键修复：开发模式下把 store 暴露到 window，便于 E2E 测试和调试
+// - 通过 page.evaluate(() => window.__canvasStore.getState()) 可读 elements 等
+// - 生产环境不暴露（import.meta.env.PROD）
+if (import.meta.env.DEV) {
+  ;(window as unknown as { __canvasStore: typeof useCanvasStore }).__canvasStore = useCanvasStore
+}

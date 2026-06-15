@@ -1,9 +1,24 @@
-import { Router, Request, Response, NextFunction } from 'express'
+/**
+ * 认证相关 API 路由 (authRoutes)
+ *
+ * 端点：
+ * - POST /api/auth/register  注册
+ * - POST /api/auth/login     登录
+ * - GET  /api/auth/me        当前用户信息
+ *
+ * 关键修复（Phase 7）：
+ * - 全部异步 handler 用 asyncHandler 包装，自动捕获 throw → errorHandler
+ * - 业务错误用 AppError 抛出（如 EMAIL_TAKEN、NOT_FOUND）
+ * - 校验中间件 use validate()，不再手写字段检查
+ */
+
+import { Router, Request, Response } from 'express'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import User from '../models/User'
 import { auth } from '../middleware/auth'
 import { validate } from '../middleware/validate'
+import { AppError, asyncHandler } from '../middleware/errorHandler'
 
 const router = Router()
 
@@ -17,119 +32,86 @@ router.post(
   '/register',
   validate([
     { field: 'email', required: true, type: 'email' },
-    { field: 'password', required: true, minLength: 6 },
+    { field: 'password', required: true, minLength: 6, maxLength: 64 },
     { field: 'name', required: true, minLength: 1, maxLength: 50 },
   ]),
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const { email, password, name } = req.body
+  asyncHandler(async (req: Request, res: Response) => {
+    const { email, password, name } = req.body
 
-      const existingUser = await User.findOne({ email })
-      if (existingUser) {
-        res.status(409).json({
-          success: false,
-          error: {
-            code: 'EMAIL_TAKEN',
-            message: '该邮箱已注册，请直接登录',
-          },
-        })
-        return
-      }
-
-      const hashedPassword = await bcrypt.hash(password, 10)
-      const user = await User.create({
-        email,
-        password: hashedPassword,
-        name,
-      })
-
-      const token = generateToken(String(user._id), user.email)
-
-      res.status(201).json({
-        success: true,
-        data: {
-          token,
-          user: {
-            id: user._id,
-            email: user.email,
-            name: user.name,
-            avatar: user.avatar,
-          },
-        },
-      })
-    } catch (error) {
-      next(error)
+    const existingUser = await User.findOne({ email })
+    if (existingUser) {
+      throw new AppError('EMAIL_TAKEN', '该邮箱已注册，请直接登录', 409)
     }
-  }
+
+    const hashedPassword = await bcrypt.hash(password, 10)
+    const user = await User.create({
+      email,
+      password: hashedPassword,
+      name,
+    })
+
+    const token = generateToken(String(user._id), user.email)
+
+    res.status(201).json({
+      success: true,
+      data: {
+        token,
+        user: {
+          id: user._id,
+          email: user.email,
+          name: user.name,
+          avatar: user.avatar,
+        },
+      },
+    })
+  })
 )
 
 router.post(
   '/login',
   validate([
     { field: 'email', required: true, type: 'email' },
-    { field: 'password', required: true, minLength: 6 },
+    { field: 'password', required: true, minLength: 6, maxLength: 64 },
   ]),
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const { email, password } = req.body
+  asyncHandler(async (req: Request, res: Response) => {
+    const { email, password } = req.body
 
-      const user = await User.findOne({ email })
-      if (!user) {
-        res.status(401).json({
-          success: false,
-          error: {
-            code: 'AUTH_ERROR',
-            message: 'Invalid email or password',
-          },
-        })
-        return
-      }
-
-      const isMatch = await bcrypt.compare(password, user.password)
-      if (!isMatch) {
-        res.status(401).json({
-          success: false,
-          error: {
-            code: 'AUTH_ERROR',
-            message: 'Invalid email or password',
-          },
-        })
-        return
-      }
-
-      const token = generateToken(String(user._id), user.email)
-
-      res.json({
-        success: true,
-        data: {
-          token,
-          user: {
-            id: user._id,
-            email: user.email,
-            name: user.name,
-            avatar: user.avatar,
-          },
-        },
-      })
-    } catch (error) {
-      next(error)
+    const user = await User.findOne({ email })
+    if (!user) {
+      // 关键修复：使用 AppError，message 仍可自定义
+      throw new AppError('AUTH_ERROR', 'Invalid email or password', 401)
     }
-  }
+
+    const isMatch = await bcrypt.compare(password, user.password)
+    if (!isMatch) {
+      throw new AppError('AUTH_ERROR', 'Invalid email or password', 401)
+    }
+
+    const token = generateToken(String(user._id), user.email)
+
+    res.json({
+      success: true,
+      data: {
+        token,
+        user: {
+          id: user._id,
+          email: user.email,
+          name: user.name,
+          avatar: user.avatar,
+        },
+      },
+    })
+  })
 )
 
-router.get('/me', auth, async (req: Request, res: Response, next: NextFunction) => {
-  try {
+router.get(
+  '/me',
+  auth,
+  asyncHandler(async (req: Request, res: Response) => {
     const user = await User.findById(req.user?.userId).select('-password')
 
     if (!user) {
-      res.status(404).json({
-        success: false,
-        error: {
-          code: 'NOT_FOUND',
-          message: 'User not found',
-        },
-      })
-      return
+      throw new AppError('NOT_FOUND', 'User not found', 404)
     }
 
     res.json({
@@ -143,9 +125,7 @@ router.get('/me', auth, async (req: Request, res: Response, next: NextFunction) 
         },
       },
     })
-  } catch (error) {
-    next(error)
-  }
-})
+  })
+)
 
 export default router

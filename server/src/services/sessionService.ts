@@ -14,7 +14,7 @@
  * - Redis 不可用时所有方法降级为 no-op（不阻塞主流程）
  */
 
-import { redisClient } from '../config/redis'
+import { getActiveRedisClient } from '../config/redis'
 
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60 // 7 天
 const SESSION_KEY = (userId: string) => `session:${userId}`
@@ -48,6 +48,7 @@ export async function createSession(
   token?: string
 ): Promise<void> {
   try {
+    const redis = getActiveRedisClient()
     const now = Date.now()
     const sessionData: SessionData = {
       userId,
@@ -55,11 +56,11 @@ export async function createSession(
       lastActiveAt: now,
       ...data,
     }
-    await redisClient.set(SESSION_KEY(userId), JSON.stringify(sessionData), {
+    await redis.set(SESSION_KEY(userId), JSON.stringify(sessionData), {
       EX: SESSION_TTL_SECONDS,
     })
     if (token) {
-      await redisClient.set(TOKEN_KEY(token), userId, { EX: SESSION_TTL_SECONDS })
+      await redis.set(TOKEN_KEY(token), userId, { EX: SESSION_TTL_SECONDS })
     }
   } catch (err) {
     console.warn('[sessionService] createSession failed:', (err as Error).message)
@@ -71,7 +72,8 @@ export async function createSession(
  */
 export async function getSession(userId: string): Promise<SessionData | null> {
   try {
-    const raw = await redisClient.get(SESSION_KEY(userId))
+    const redis = getActiveRedisClient()
+    const raw = await redis.get(SESSION_KEY(userId))
     if (!raw) return null
     return JSON.parse(raw) as SessionData
   } catch (err) {
@@ -85,7 +87,8 @@ export async function getSession(userId: string): Promise<SessionData | null> {
  */
 export async function getUserIdByToken(token: string): Promise<string | null> {
   try {
-    return await redisClient.get(TOKEN_KEY(token))
+    const redis = getActiveRedisClient()
+    return await redis.get(TOKEN_KEY(token))
   } catch (err) {
     console.warn('[sessionService] getUserIdByToken failed:', (err as Error).message)
     return null
@@ -97,8 +100,9 @@ export async function getUserIdByToken(token: string): Promise<string | null> {
  */
 export async function deleteSession(userId: string, token?: string): Promise<void> {
   try {
-    await redisClient.del(SESSION_KEY(userId))
-    if (token) await redisClient.del(TOKEN_KEY(token))
+    const redis = getActiveRedisClient()
+    await redis.del(SESSION_KEY(userId))
+    if (token) await redis.del(TOKEN_KEY(token))
   } catch (err) {
     console.warn('[sessionService] deleteSession failed:', (err as Error).message)
   }
@@ -114,7 +118,8 @@ export async function isTokenValid(token: string, userId: string): Promise<boole
   if (!session) return false
   // 刷新最后活跃时间
   session.lastActiveAt = Date.now()
-  await redisClient.set(SESSION_KEY(userId), JSON.stringify(session), {
+  const redis = getActiveRedisClient()
+  await redis.set(SESSION_KEY(userId), JSON.stringify(session), {
     EX: SESSION_TTL_SECONDS,
   })
   return true

@@ -79,6 +79,13 @@ export class CanvasRenderer {
 
   private animationFrameId: number | null = null
   private dirtyFlags = { main: true, temp: true, bg: true }
+  /**
+   * 关键修复：窗口失焦时暂停 rAF，节省 CPU/GPU。
+   * - 用户切到其他标签页或最小化窗口时不需要继续渲染
+   * - 恢复焦点时由 markDirty 触发首次重画
+   * 状态：true = 渲染中；false = 暂停
+   */
+  private isRendering = true
 
   constructor(
     bgCanvas: HTMLCanvasElement,
@@ -95,6 +102,9 @@ export class CanvasRenderer {
 
     this.resize()
     window.addEventListener('resize', this.resize)
+    // 关键修复：监听窗口失焦 / 恢复焦点，暂停 / 恢复 rAF 循环
+    window.addEventListener('blur', this.handleWindowBlur)
+    window.addEventListener('focus', this.handleWindowFocus)
     this.startRenderLoop()
   }
 
@@ -203,6 +213,34 @@ export class CanvasRenderer {
       cancelAnimationFrame(this.animationFrameId)
     }
     window.removeEventListener('resize', this.resize)
+    // 关键修复：清理 blur/focus 监听器，避免内存泄漏
+    window.removeEventListener('blur', this.handleWindowBlur)
+    window.removeEventListener('focus', this.handleWindowFocus)
+  }
+
+  /**
+   * 窗口失焦：暂停 rAF 循环
+   *
+   * 浏览器对失焦标签页的 rAF 频率会自动节流到 1Hz，
+   * 但主动取消 rAF 更彻底地节省 CPU/GPU。
+   */
+  private handleWindowBlur = () => {
+    this.isRendering = false
+    if (this.animationFrameId !== null) {
+      cancelAnimationFrame(this.animationFrameId)
+      this.animationFrameId = null
+    }
+  }
+
+  /**
+   * 窗口恢复焦点：重新启动 rAF，并标记所有层为脏以重画
+   */
+  private handleWindowFocus = () => {
+    if (!this.isRendering) {
+      this.isRendering = true
+      this.markDirty('all')
+      this.startRenderLoop()
+    }
   }
 
   /**
@@ -396,18 +434,43 @@ export class CanvasRenderer {
 
   private startRenderLoop() {
     const render = () => {
-      if (this.dirtyFlags.bg) {
-        this.renderBackground()
-        this.dirtyFlags.bg = false
+      // 关键修复：被暂停时直接退出，不再 requestAnimationFrame
+      if (!this.isRendering) {
+        this.animationFrameId = null
+        return
       }
 
-      if (this.dirtyFlags.main) {
-        this.renderMainLayer()
+      // 关键修复：用 try/catch 包裹每层渲染
+      // 单帧渲染错误不应中断 rAF 循环，避免后续帧无法重画
+      try {
+        if (this.dirtyFlags.bg) {
+          this.renderBackground()
+          this.dirtyFlags.bg = false
+        }
+      } catch (err) {
+        console.error('[CanvasRenderer] renderBackground error:', err)
+        this.dirtyFlags.bg = false // 避免每帧都抛
+      }
+
+      try {
+        if (this.dirtyFlags.main) {
+          this.renderMainLayer()
+          this.dirtyFlags.main = false
+        }
+      } catch (err) {
+        // 关键修复：Canvas 渲染错误不影响 React 组件树
+        // 也不让一帧错误卡住整个 rAF
+        console.error('[CanvasRenderer] renderMainLayer error:', err)
         this.dirtyFlags.main = false
       }
 
-      if (this.dirtyFlags.temp) {
-        this.renderTempLayer()
+      try {
+        if (this.dirtyFlags.temp) {
+          this.renderTempLayer()
+          this.dirtyFlags.temp = false
+        }
+      } catch (err) {
+        console.error('[CanvasRenderer] renderTempLayer error:', err)
         this.dirtyFlags.temp = false
       }
 
@@ -629,8 +692,16 @@ export class CanvasRenderer {
             anchorX = element.x + element.width
           }
 
+          // 关键修复：超长文本截断（>500 字符）边界情况处理
+          // - 截断首段后加省略号
+          // - 防止超长文本导致 fillText 卡顿和性能问题
+          let displayText = element.text
+          if (displayText.length > 500) {
+            displayText = displayText.substring(0, 497) + '...'
+          }
+
           // 关键修复：支持多行（按 \n 拆分）
-          const lines = element.text.split('\n')
+          const lines = displayText.split('\n')
           const lineHeight = fontSize * 1.4
           for (let i = 0; i < lines.length; i++) {
             ctx.fillText(lines[i], anchorX, element.y + i * lineHeight)

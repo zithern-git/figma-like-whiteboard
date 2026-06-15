@@ -13,7 +13,7 @@
  * 失效：clearState() 用于白板删除 / 强制重新加载
  */
 
-import { redisClient } from '../config/redis'
+import { getActiveRedisClient } from '../config/redis'
 import Whiteboard, { CanvasElementShape } from '../models/Whiteboard'
 
 const STATE_TTL_SECONDS = 5 * 60 // 5 分钟
@@ -28,7 +28,8 @@ export async function getState(
   shortId: string
 ): Promise<{ elements: CanvasElementShape[]; version: number } | null> {
   try {
-    const raw = await redisClient.get(STATE_KEY(shortId))
+    const redis = getActiveRedisClient()
+    const raw = await redis.get(STATE_KEY(shortId))
     if (raw) {
       const parsed = JSON.parse(raw) as { elements: CanvasElementShape[]; version: number }
       return parsed
@@ -63,8 +64,9 @@ export async function setState(
   version?: number
 ): Promise<void> {
   try {
+    const redis = getActiveRedisClient()
     const data = { elements, version: version ?? Date.now() }
-    await redisClient.set(STATE_KEY(shortId), JSON.stringify(data), {
+    await redis.set(STATE_KEY(shortId), JSON.stringify(data), {
       EX: STATE_TTL_SECONDS,
     })
   } catch (err) {
@@ -77,7 +79,8 @@ export async function setState(
  */
 export async function clearState(shortId: string): Promise<void> {
   try {
-    await redisClient.del(STATE_KEY(shortId))
+    const redis = getActiveRedisClient()
+    await redis.del(STATE_KEY(shortId))
   } catch (err) {
     console.warn('[stateCache] clearState failed:', (err as Error).message)
   }
