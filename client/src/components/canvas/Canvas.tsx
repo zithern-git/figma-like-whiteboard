@@ -1,11 +1,14 @@
 import { useRef, useEffect, useCallback } from 'react'
 import { CanvasRenderer } from '@/canvas/CanvasRenderer'
 import { CanvasElement } from '@/canvas/CanvasElement'
+import { loadViewport } from '@/canvas/viewportStorage'
 
 interface CanvasProps {
   onRendererReady: (renderer: CanvasRenderer) => void
   elements: CanvasElement[]
   selectedIds: Set<string>
+  /** 关键修复：白板 ID，用于 viewport 持久化的 localStorage 命名空间 */
+  whiteboardId?: string
   onMouseDown?: (e: React.MouseEvent<HTMLCanvasElement>) => void
   onMouseMove?: (e: React.MouseEvent<HTMLCanvasElement>) => void
   onMouseUp?: (e: React.MouseEvent<HTMLCanvasElement>) => void
@@ -17,6 +20,7 @@ export default function Canvas({
   onRendererReady,
   elements,
   selectedIds,
+  whiteboardId,
   onMouseDown,
   onMouseMove,
   onMouseUp,
@@ -31,10 +35,18 @@ export default function Canvas({
   useEffect(() => {
     if (!bgCanvasRef.current || !mainCanvasRef.current || !tempCanvasRef.current) return
 
+    // 关键修复：从 localStorage 恢复用户上次的视口状态（平移/缩放位置），
+    // 避免拖动 / 缩放后刷新页面视口被重置为 (0, 0, 1)。按 whiteboardId 命名空间隔离。
+    const restoredViewport = whiteboardId ? loadViewport(whiteboardId) : undefined
+
     const renderer = new CanvasRenderer(
       bgCanvasRef.current,
       mainCanvasRef.current,
-      tempCanvasRef.current
+      tempCanvasRef.current,
+      {
+        whiteboardId,
+        initialViewport: restoredViewport,
+      }
     )
     rendererRef.current = renderer
     onRendererReady(renderer)
@@ -43,7 +55,7 @@ export default function Canvas({
       renderer.destroy()
       rendererRef.current = null
     }
-  }, [onRendererReady])
+  }, [onRendererReady, whiteboardId])
 
   useEffect(() => {
     if (rendererRef.current) {
@@ -57,6 +69,35 @@ export default function Canvas({
     }
   }, [selectedIds])
 
+  // 关键修复：监听 canvas 容器尺寸变化（属性面板折叠/展开、侧栏宽度调整等
+  // 不会触发 window.resize，但会让容器变宽/变窄），调用 renderer.resizeAndRender()
+  // 同步内部 canvas bitmap 尺寸并立即重绘，避免出现空白区或拉伸。
+  //
+  // 闭包读 rendererRef.current 而不是捕获 r，避免 renderer 重建后引用旧实例。
+  //
+  // rAF 批处理：属性面板的 width 过渡动画会触发 ResizeObserver 在每帧（约 60fps）
+  // 持续触发；不做批处理会导致每帧都执行 canvas.width = X（清空画布）然后重绘，
+  // 视觉上表现为闪烁。rAF 批处理后，每个动画帧最多重置一次。
+  //
+  // resize + redraw 原子化：进一步消除"canvas.width=X 之后到下一帧 render() 之前"
+  // 这一帧间隙（约 16ms），避免看到空白画布。
+  useEffect(() => {
+    const target = bgCanvasRef.current?.parentElement
+    if (!target) return
+
+    let scheduled = false
+    const observer = new ResizeObserver(() => {
+      if (scheduled) return
+      scheduled = true
+      requestAnimationFrame(() => {
+        scheduled = false
+        rendererRef.current?.resizeAndRender()
+      })
+    })
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [])
+
   const getRenderer = useCallback((): CanvasRenderer | null => {
     return rendererRef.current
   }, [])
@@ -68,7 +109,7 @@ export default function Canvas({
       const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
       const sx = e.clientX - rect.left
       const sy = e.clientY - rect.top
-      const w = r.screenToWorld(sx, sy)
+      void r.screenToWorld(sx, sy)
 
       ;(e as unknown as Record<string, unknown>)._getRenderer = getRenderer
       onMouseDown?.(e)
@@ -83,7 +124,7 @@ export default function Canvas({
       const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
       const sx = e.clientX - rect.left
       const sy = e.clientY - rect.top
-      const w = r.screenToWorld(sx, sy)
+      void r.screenToWorld(sx, sy)
 
       ;(e as unknown as Record<string, unknown>)._getRenderer = getRenderer
       onMouseMove?.(e)
@@ -98,7 +139,7 @@ export default function Canvas({
       const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
       const sx = e.clientX - rect.left
       const sy = e.clientY - rect.top
-      const w = r.screenToWorld(sx, sy)
+      void r.screenToWorld(sx, sy)
 
       ;(e as unknown as Record<string, unknown>)._getRenderer = getRenderer
       onMouseUp?.(e)

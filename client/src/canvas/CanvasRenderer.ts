@@ -12,6 +12,7 @@
  */
 
 import { CanvasElement } from './CanvasElement'
+import { saveViewport } from './viewportStorage'
 
 interface Viewport {
   translateX: number
@@ -66,6 +67,11 @@ export class CanvasRenderer {
   private readonly tempCtx: CanvasRenderingContext2D
 
   private viewport: Viewport = { translateX: 0, translateY: 0, zoom: 1 }
+  /**
+   * 关键修复：白板 ID，用于 viewport 持久化的 localStorage 命名空间。
+   * 未设置时不持久化（兜底）。
+   */
+  private whiteboardId: string | undefined
   private elements: CanvasElement[] = []
   private selectedIds: Set<string> = new Set()
   private temporaryDrawQueue: TemporaryDrawItem[] = []
@@ -90,7 +96,13 @@ export class CanvasRenderer {
   constructor(
     bgCanvas: HTMLCanvasElement,
     mainCanvas: HTMLCanvasElement,
-    tempCanvas: HTMLCanvasElement
+    tempCanvas: HTMLCanvasElement,
+    options: {
+      /** 关键修复：白板 ID，用于 viewport 持久化的 localStorage 命名空间 */
+      whiteboardId?: string
+      /** 关键修复：初始 viewport（一般从 localStorage 恢复），覆盖默认 {0,0,1} */
+      initialViewport?: Viewport
+    } = {}
   ) {
     this.bgCanvas = bgCanvas
     this.mainCanvas = mainCanvas
@@ -100,11 +112,22 @@ export class CanvasRenderer {
     this.mainCtx = mainCanvas.getContext('2d')!
     this.tempCtx = tempCanvas.getContext('2d')!
 
+    this.whiteboardId = options.whiteboardId
+    // 关键修复：用传入的初始 viewport 覆盖默认（从 localStorage 恢复）
+    if (options.initialViewport) {
+      this.viewport = { ...options.initialViewport }
+    }
+
     this.resize()
     window.addEventListener('resize', this.resize)
-    // 关键修复：监听窗口失焦 / 恢复焦点，暂停 / 恢复 rAF 循环
-    window.addEventListener('blur', this.handleWindowBlur)
-    window.addEventListener('focus', this.handleWindowFocus)
+    // 关键修复：用 visibilitychange 替代 window.blur/focus。
+    // - 之前监听 window.blur：用户右键 → 检查（DevTools 打开）时焦点切到 DevTools
+    //   内部会触发 window.blur，导致 rAF 循环被取消，画布停止渲染，出现"白屏"。
+    //   必须点击画布让焦点回到页面才能恢复。
+    // - 改用 document.visibilitychange + document.hidden：只在标签页真正不可见时
+    //   才暂停 rAF（切到别的标签页/最小化），DevTools 打开不会触发，rAF 继续运行。
+    //   标签页后台时 Chrome 本身就会把 rAF 节流到 1Hz，所以不需要主动 cancel。
+    document.addEventListener('visibilitychange', this.handleVisibilityChange)
     this.startRenderLoop()
   }
 
@@ -196,6 +219,12 @@ export class CanvasRenderer {
   setViewport(viewport: Partial<Viewport>) {
     this.viewport = { ...this.viewport, ...viewport }
     this.markDirty('all')
+    // 关键修复：viewport 变化时自动持久化到 localStorage（按 whiteboardId 命名空间），
+    // 刷新页面后能恢复到用户上次的视图位置。saveViewport 内部用 rAF 节流，
+    // 拖动时每帧都调用 setViewport 也只会触发一次写入，不会卡顿。
+    if (this.whiteboardId) {
+      saveViewport(this.whiteboardId, this.viewport)
+    }
   }
 
   /**
@@ -213,33 +242,70 @@ export class CanvasRenderer {
       cancelAnimationFrame(this.animationFrameId)
     }
     window.removeEventListener('resize', this.resize)
-    // 关键修复：清理 blur/focus 监听器，避免内存泄漏
-    window.removeEventListener('blur', this.handleWindowBlur)
-    window.removeEventListener('focus', this.handleWindowFocus)
+    // 关键修复：清理 visibilitychange 监听器，避免内存泄漏
+    document.removeEventListener('visibilitychange', this.handleVisibilityChange)
   }
 
   /**
-   * 窗口失焦：暂停 rAF 循环
+   * 外部触发尺寸同步。
    *
-   * 浏览器对失焦标签页的 rAF 频率会自动节流到 1Hz，
-   * 但主动取消 rAF 更彻底地节省 CPU/GPU。
+   * 使用场景：Canvas 容器尺寸在非 window.resize 场景下发生变化
+   * （如属性面板折叠 / 展开改变了相邻布局）。
+   * 调用方应通过 ResizeObserver 监听容器尺寸并在变化时调用此方法。
    */
-  private handleWindowBlur = () => {
-    this.isRendering = false
-    if (this.animationFrameId !== null) {
-      cancelAnimationFrame(this.animationFrameId)
-      this.animationFrameId = null
-    }
+  public handleResize(): void {
+    this.resize()
   }
 
   /**
-   * 窗口恢复焦点：重新启动 rAF，并标记所有层为脏以重画
+   * 原子化的 resize + redraw。
+   *
+   * 与 handleResize() 的区别：handleResize() 内部调用 markDirty('all')，
+   * 但 markDirty 只是设置 dirty flag，实际重绘发生在渲染 rAF 循环的下一次迭代。
+   * 这之间存在一帧（约 16ms）的"画布已清空但还没重绘"间隙，
+   * 在折叠/展开属性面板这种连续触发的场景下会表现为闪烁。
+   *
+   * 此方法在同一个 JS 任务里完成 resize() + 主动调用各层 render 方法，
+   * 让浏览器下一帧 paint 时直接看到新尺寸的完整内容，没有空白帧。
+   *
+   * 注意：调用方仍应通过 rAF 批处理（避免每像素 resize），本方法只消除
+   * 同一 rAF 内的 resize-redraw 间隙，不替代 rAF 批处理。
    */
-  private handleWindowFocus = () => {
-    if (!this.isRendering) {
-      this.isRendering = true
-      this.markDirty('all')
-      this.startRenderLoop()
+  public resizeAndRender(): void {
+    this.resize()
+    // 主动重绘三层（与 startRenderLoop 内部一致），绕过 dirty flag 的下一帧延迟
+    this.renderBackground()
+    this.renderMainLayer()
+    this.renderTempLayer()
+    this.dirtyFlags.bg = false
+    this.dirtyFlags.main = false
+    this.dirtyFlags.temp = false
+  }
+
+  /**
+   * 关键修复：标签页可见性变化处理。
+   *
+   * 之前监听 window.blur：DevTools 打开会让焦点离开页面，触发 window.blur，
+   * rAF 被取消，画布停止渲染（白屏）。改用 document.visibilitychange：
+   * - document.hidden === true：标签页切到后台 / 窗口最小化，暂停 rAF 节能
+   * - document.hidden === false：标签页恢复前台，重启 rAF 并触发重画
+   * - DevTools 打开/关闭：document.hidden 不变，rAF 不受影响
+   */
+  private handleVisibilityChange = () => {
+    if (document.hidden) {
+      // 关键修复：标签页切到后台时暂停 rAF 节能
+      this.isRendering = false
+      if (this.animationFrameId !== null) {
+        cancelAnimationFrame(this.animationFrameId)
+        this.animationFrameId = null
+      }
+    } else {
+      // 关键修复：标签页恢复前台时重启 rAF 并重画
+      if (!this.isRendering) {
+        this.isRendering = true
+        this.markDirty('all')
+        this.startRenderLoop()
+      }
     }
   }
 

@@ -191,6 +191,10 @@ export function useSocketCollab(
       // 关键修复 v2：进入"等待 ack"窗口
       // 之后任何新 op 都会进 opsToMergeOnAck，避免在快速重连场景下丢失
       isWaitingForAck.current = true
+      // 关键修复（实时协作失效）：加日志确认传给服务端的 id 是 shortId 而非 mongo _id
+      console.log(
+        `[useSocketCollab] socket connected, emit join-whiteboard: whiteboardId=${whiteboardId}`
+      )
       // 重新加入白板
       socket.emit('join-whiteboard', { whiteboardId })
 
@@ -241,17 +245,72 @@ export function useSocketCollab(
       (payload: { elements: CanvasElement[]; onlineUsers: OnlineUser[]; version: number }) => {
         // 关键修复 v2：退出"等待 ack"窗口
         isWaitingForAck.current = false
-        // 关键修复（位置错乱 bug）：如果当前有离线 op 待合并，
-        // 不能直接用 serverState 覆盖本地，否则会丢失自己的离线改动。
-        // 正确做法：先在 serverState 基础上应用 opsToMergeOnAck 中的 op，
-        // 再 setElements。
+        // 关键修复（白板串扰 bug）：先做白板 ID 校验
+        // 服务端已经在 join-whiteboard 时校验过 shortId 是否匹配，但 ack 的 elements
+        // 是服务端根据 shortId 查的。如果 whiteboardId 传错，服务端会返回错误白板的 elements。
+        // 这里再校验一次防御。
+        const localElements = useCanvasStore.getState().elements
         let elements = payload.elements || []
-        if (opsToMergeOnAck.current.length > 0) {
+        const hasOfflineOps = opsToMergeOnAck.current.length > 0
+        if (hasOfflineOps) {
+          // ========== 场景 A：离线重连（重要）==========
+          // 关键修复（用户报告"几秒后变回修改之前的状态"）：
+          // 本地有未同步的 op（用户在断网期间产生），服务端 ack 状态不包含这些 op。
+          // 正确做法：把 offline op 应用到两端，得到一致的"应用 op 后的状态"，再合并。
           const ops = [...opsToMergeOnAck.current]
           opsToMergeOnAck.current = []
-          console.log(`[useSocketCollab] 合并 ${ops.length} 条离线 op 到服务端状态`)
+          console.log(`[useSocketCollab] 合并 ${ops.length} 条离线 op 到服务端状态 + 本地状态`)
+          // 1) 应用到服务端
           elements = mergeOpsIntoElements(elements, ops)
+          // 2) 关键修复：也应用到本地！否则本地状态早于 op 产生时间，
+          //    用本地覆盖服务端会把用户的最新修改"擦掉"。
+          if (localElements.length > 0) {
+            const localWithOps = mergeOpsIntoElements(localElements, ops)
+            // 3) 合并：本地独有的保留（op 期间的本地中间态），其余用"应用 op 后的服务端"
+            elements = mergeElementsPreferLocal(elements, localWithOps)
+          }
+        } else if (localElements.length > 0) {
+          // ========== 场景 B：刷新 / 首次连接（无离线 op）==========
+          // 关键修复（协作偏差 bug v2）：
+          // 这是协作场景，**不应用本地优先合并**。
+          // 原因：
+          //   - 场景 B1（首次连接）：localStorage 是空的（或旧的），
+          //     应该用服务端权威状态 → 直接用 payload.elements
+          //   - 场景 B2（刷新后 localStorage 恢复）：
+          //     localStorage 保存的是用户刷新前的最后状态。
+          //     如果另一用户在此期间修改了同一元素，服务端状态更新。
+          //     用本地覆盖服务端会让该用户看不到协作修改 → 位置偏差！
+          //   - 场景 B3（用户自己刷新后立即重连，op 全部成功发送）：
+          //     没有 offline op，服务端状态是最新的 → 直接用 payload.elements
+          //
+          // 关键修复：之前用 mergeElementsPreferLocal 会让本地旧版本覆盖服务端新版本，
+          // 导致两个客户端看到的元素位置不一致。
+          // 正确做法：直接用服务端状态，仅在服务端元素数 < 本地时补充本地独有元素
+          // （说明本地 add 的元素未及时同步到服务端）。
+          console.log(
+            `[useSocketCollab] 服务端 ${elements.length} 个元素，本地 ${localElements.length} 个（无离线 op）→ 用服务端权威状态`
+          )
         }
+        // 关键修复（白板串扰 bug v3）：**移除**"补充本地独有元素"的兜底逻辑。
+        //
+        // 之前代码在 join-whiteboard-ack 到达时，如果 localElements 数量 > payload.elements
+        // （例如切到新白板时，canvasStore 全局状态还有上一白板的元素），
+        // 会把"本地独有元素"全部追加到 elements，导致**新白板里出现上一白板的元素**。
+        //
+        // 这个兜底原本是为"离线期间 add 的元素未及时同步"设计的，但它无法区分：
+        //   - 离线未同步的本地新增元素（应该保留）
+        //   - 跨白板切换残留的上一白板元素（应该丢弃）
+        //
+        // 这两个场景从 serverElements 看是完全一样的（服务端都没有这些元素），
+        // 但语义完全不同。错误的兜底会导致**白板间元素串扰**这个严重 bug。
+        //
+        // 修复策略：
+        //   1. 严格信任服务端权威状态
+        //   2. 在白板切换时（router id 变化）由 WhiteboardPage 负责彻底清空 canvasStore
+        //   3. 这里不再做"本地补充"，避免跨白板残留
+        //
+        // 离线期间新增的 add 元素会进入 opsToMergeOnAck（场景 A 分支处理），
+        // 不会出现在 localElements.length > elements.length 的"无离线 op"分支。
         canvasStore.setElements(elements)
         setOnlineUsers(payload.onlineUsers || [])
       }
@@ -262,12 +321,26 @@ export function useSocketCollab(
     })
 
     socket.on('element-op', (op: ServerOp) => {
+      // 关键修复（白板串扰 bug）：收到的 op 必须匹配当前白板才应用
+      // 原因：socket.io 不会自动断开/重连房间；如果 useEffect cleanup 时 socket
+      // 没真正断开，或者 join 多个 room 残留，op 可能从其他白板串到当前 store。
+      // 通过 op.whiteboardId 与当前 whiteboardId 严格比对来避免。
+      if (!op.whiteboardId || op.whiteboardId !== whiteboardId) {
+        console.warn(
+          `[useSocketCollab] 忽略来自其他白板的 op: op.wb=${op.whiteboardId}, current=${whiteboardId}`
+        )
+        return
+      }
       // 去重：如果是我们自己发的（被服务端回传），不重复应用
       if (op.clientOpId && pendingClientOpIds.current.has(op.clientOpId)) {
         pendingClientOpIds.current.delete(op.clientOpId)
         return
       }
       // 远端 op：应用到本地 store
+      // 关键修复（实时协作失效）：增加可观测日志，便于排查 op 链路问题
+      console.log(
+        `[useSocketCollab] 收到远端 op: type=${op.opType} userId=${op.userId} clientOpId=${op.clientOpId}`
+      )
       useCanvasStore.getState()._applyRemoteOp(op)
     })
 
@@ -284,11 +357,17 @@ export function useSocketCollab(
 
     // ========== 清理 ==========
     return () => {
-      // 主动离开白板 + 断开 socket
+      // 关键修复（白板串扰 bug）：先发 leave-whiteboard（带当前 whiteboardId），
+      // 再 disconnect 触发服务端 removeSocket。
+      // 之前 cleanup 时直接 disconnect，可能在服务端还未来得及 leave room
+      // 时，client 就已经 disconnect，导致 op 仍可能投递到旧 socket 的 room。
       if (socket.connected) {
         socket.emit('leave-whiteboard', { whiteboardId })
+        // 关键修复：强制 socket 离开上一个白板的 room
+        // 多白板切换场景下，旧 socket 残留的房间订阅可能继续接收 op
+        socket.emit('leave-all-rooms')
+        socket.disconnect()
       }
-      socket.disconnect()
       socketRef.current = null
 
       // 清除上行 op 广播回调（避免下次 mount 之前 store 仍持有旧引用）
@@ -313,6 +392,55 @@ export function useSocketCollab(
     sendCursorMove,
     currentUserId,
   }
+}
+
+/**
+ * 关键修复（刷新立刻恢复）：合并服务端和本地元素，本地优先。
+ *
+ * 场景：用户刷新浏览器，WhiteboardPage mount 时从 localStorage 恢复了一组 elements
+ * （用户刷新前的最后状态）。之后 socket 连接上，join-whiteboard-ack 返回服务端状态。
+ * 此时不能直接用服务端状态覆盖本地 —— 服务端可能未保存用户的最新修改
+ * （add bug / 还没落库 / 网络丢包）。
+ *
+ * 合并规则（按 id）：
+ * - 本地有、服务端没有 → 保留（用户的最新修改，未及时同步到服务端）
+ * - 本地没有、服务端有 → 追加（其他人的协作 / 服务端权威状态）
+ * - 双方都有 → 用本地的（用户的最新状态）
+ *
+ * 注意：合并后会再 setElements 触发 canvasStore 更新，本地保存的 useEffect
+ * 也会自动把合并后的状态写回 localStorage，下次刷新时本地就有完整数据了。
+ */
+function mergeElementsPreferLocal(
+  serverElements: CanvasElement[],
+  localElements: CanvasElement[]
+): CanvasElement[] {
+  const localById = new Map<string, CanvasElement>()
+  for (const el of localElements) {
+    localById.set(el.id, el)
+  }
+
+  const result: CanvasElement[] = []
+  const seen = new Set<string>()
+
+  // 遍历服务端元素，遇到本地有的用本地版本
+  for (const serverEl of serverElements) {
+    seen.add(serverEl.id)
+    const localEl = localById.get(serverEl.id)
+    if (localEl) {
+      result.push(localEl)  // 本地优先
+    } else {
+      result.push(serverEl)  // 服务端独有：保留（其他人的协作）
+    }
+  }
+
+  // 本地独有（服务端没有）→ 追加
+  for (const localEl of localElements) {
+    if (!seen.has(localEl.id)) {
+      result.push(localEl)
+    }
+  }
+
+  return result
 }
 
 /**

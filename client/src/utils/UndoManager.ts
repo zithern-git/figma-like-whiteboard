@@ -22,6 +22,12 @@ import { BatchCommand, Command, UpdateElementCommand } from './Command'
 /** 栈容量上限：超出后丢弃最早的历史（破坏最早 50 步之外的历史） */
 export const UNDO_STACK_LIMIT = 50
 
+/**
+ * 关键修复（刷新后保留 undo 栈）：序列化栈快照（只读视图）。
+ * 把内部 Command[] 序列化为可 JSON 化的纯数据，用于持久化到 localStorage。
+ */
+export type SerializedUndoStack = ReturnType<Command['serialize']>[]
+
 export class UndoManager {
   private undoStack: Command[] = []
   private redoStack: Command[] = []
@@ -166,6 +172,37 @@ export class UndoManager {
 
   getRedoStackSnapshot(): readonly Command[] {
     return this.redoStack
+  }
+
+  /**
+   * 关键修复（刷新后保留 undo 栈）：把内部 Command[] 序列化为可 JSON 数据。
+   * 用于持久化到 localStorage。注意只序列化"已提交的"undo/redo 栈（不含正在进行的 batch）。
+   */
+  serializeUndoStack(): SerializedUndoStack {
+    return this.undoStack.map((c) => c.serialize())
+  }
+
+  serializeRedoStack(): SerializedUndoStack {
+    return this.redoStack.map((c) => c.serialize())
+  }
+
+  /**
+   * 关键修复（刷新后保留 undo 栈）：用序列化数据替换整个 undo 栈。
+   * 用于：刷新后从 localStorage 恢复栈。
+   * 调用方负责把 SerializedCommandData[] 反序列化为 Command[]（需要 store 引用）。
+   *
+   * 注意：会同时清空 redoStack（恢复后不应该重做到"还没发生的"操作）。
+   * 会清空 currentBatch（刷新时不应该有未完成的 batch）。
+   */
+  restoreStacks(
+    undoCommands: Command[],
+    redoCommands: Command[]
+  ): void {
+    this.undoStack = [...undoCommands]
+    this.redoStack = [...redoCommands]
+    this.currentBatchId = null
+    this.currentBatchCmds = []
+    this.onChange()
   }
 
   /**

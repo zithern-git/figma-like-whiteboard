@@ -7,6 +7,9 @@
     "dev": "ts-node --transpile-only src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
+    "test": "ts-node --transpile-only tests/ot.test.ts && ts-node --transpile-only tests/otService.integration.test.ts",
+    "test:ot": "ts-node --transpile-only tests/ot.test.ts",
+    "test:integration": "ts-node --transpile-only tests/otService.integration.test.ts",
     "lint": "eslint src --ext .ts"
   },
   "keywords": [],

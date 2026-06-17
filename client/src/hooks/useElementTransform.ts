@@ -19,6 +19,7 @@ import { useCallback, useRef } from "react";
 import { CanvasRenderer, HitArea } from "@/canvas";
 import { CanvasElement } from "@/canvas/CanvasElement";
 import { useCanvasStore } from "@/stores/canvasStore";
+import { deepClone } from "@/utils/Command";
 
 /** 变换操作类型 */
 type TransformType = "move" | "scale" | "rotate" | "none";
@@ -52,6 +53,14 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
    *
    * 通过 renderer.hitTest 判定当前点落在哪个区域（手柄/主体/无），
    * 据此决定 transformType；记录选中元素的初始状态和起始点。
+   *
+   * 关键修复（实时协作 / 拖动回放 bug）：不再调 beginUndoBatch。
+   * 原因：之前的设计是"拖动期间每次 updateElement 都入栈，endBatch 合并为单次 undo"。
+   * 但 updateElement 会广播 op → 拖动期间产生 N 个 update op 给 B
+   * → B 端逐帧 apply，看到移动过程的"回放"，而不是最终位置。
+   *
+   * 新设计：拖动期间用 _updateElementLive（不广播不入栈），PointerUp 时
+   * 计算 initial → final 的 diff，调一次 updateElement 提交最终值（入栈 + 广播）。
    *
    * @param e - 鼠标事件
    */
@@ -101,18 +110,13 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
       activeHandle.current = hit.type === "scale" ? hit.handle : null;
       isTransforming.current = true;
 
-      // 关键修复：开始一个 undo batch，把整个拖拽/缩放/旋转过程中产生的
-      // 多次 updateElement 合并为一次 undo（按 Ctrl+Z 一步还原到拖拽前状态）。
-      // batchId 包含 elementId 防止与其他元素的变换冲突。
-      const transformBatchId = `transform-${Array.from(state.selectedIds).join("-")}-${Date.now()}`;
-      useCanvasStore.getState().beginUndoBatch(transformBatchId);
-
-      // 记录所有选中元素的初始状态
+      // 关键修复：记录所有选中元素的初始状态（不调 beginUndoBatch）
+      // 拖动期间用 _updateElementLive 改 store，PointerUp 时用 diff 提交最终值
       elementStatesBefore.current = new Map();
       for (const id of state.selectedIds) {
         const element = state.elements.find((el) => el.id === id);
         if (element) {
-          elementStatesBefore.current.set(id, { ...element });
+          elementStatesBefore.current.set(id, deepClone(element));
         }
       }
 
@@ -140,6 +144,15 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
    * - move：所有选中元素同步平移（dx/dy）
    * - scale：根据手柄类型重算 x/y/width/height，Shift 锁比例
    * - rotate：以元素中心为轴，atan2 角度增量更新 rotation
+   *
+   * 关键修复（实时协作 / 拖动回放 bug）：
+   * 拖动期间**只改本地 store，不广播 socket**。用 `_updateElementLive` 替代 `updateElement`：
+   *   - `_updateElementLive` → 直接改 store（_replaceElementRaw），不入 undo 栈，不广播
+   *   - 不会产生 50-100 个 op/秒 的 socket 流量
+   *   - B 端不会看到"回放过程"，而是 PointerUp 时一次性看到最终位置
+   *
+   * PointerUp（handleTransformEnd）会计算 initial → final 的 diff，
+   * 调一次 `updateElement` 提交最终值（入栈 + 广播）。
    *
    * @param e - 鼠标事件
    */
@@ -176,7 +189,8 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
                 y: p.y + dy,
               }));
             }
-            store.updateElement(id, updates);
+            // 关键修复（实时协作）：拖动期间用 _updateElementLive（不广播不入栈）
+            state._updateElementLive(id, updates);
           }
         }
       } else if (transformType.current === "scale") {
@@ -340,7 +354,8 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
             y: newY + ((p.y - oldMinY) * newH) / oldH,
           }));
         }
-        store.updateElement(id, updates);
+        // 关键修复（实时协作）：拖动期间用 _updateElementLive（不广播不入栈）
+        state._updateElementLive(id, updates);
       } else if (transformType.current === "rotate") {
         // 旋转：仅作用于单选元素
         if (state.selectedIds.size !== 1) return;
@@ -361,7 +376,8 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
           const STEP = Math.PI / 12; // 15°
           newRotation = Math.round(newRotation / STEP) * STEP;
         }
-        store.updateElement(id, { rotation: newRotation });
+        // 关键修复（实时协作）：拖动期间用 _updateElementLive（不广播不入栈）
+        state._updateElementLive(id, { rotation: newRotation });
       }
     },
     [renderer, store]
@@ -370,14 +386,56 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
   /**
    * 结束变换
    *
-   * 最终确认变换结果，清除临时状态。
+   * 关键修复（实时协作 / 拖动回放 bug）：
+   * 拖动期间用 _updateElementLive 改了 store 但不入栈不广播。
+   * PointerUp 时计算 initial → final 的 diff，调一次 updateElement 提交
+   * 最终值（入栈 + 广播），让 B 端一次性看到最终位置。
+   *
+   * 不再调 endUndoBatch（之前的设计是"拖动期间每次 updateElement 都入栈，
+   * 合并为单次 undo"——但 updateElement 会广播 op，导致 B 端看到回放）。
+   * 新设计：拖动期间不入栈，PointerUp 时一次 updateElement 入栈一次 undo。
    */
   const handleTransformEnd = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      // 关键修复：结束 undo batch，把所有 updateElement 合并为单次 undo 步骤。
-      // 放在 isTransforming 重置前，确保 batch 内已经有累积的命令。
+    (_e: React.MouseEvent<HTMLCanvasElement>) => {
       if (isTransforming.current) {
-        useCanvasStore.getState().endUndoBatch();
+        const state = useCanvasStore.getState();
+        // 对每个被变换过的元素：计算 initial → current 的 diff，
+        // 调一次 updateElement（入栈 + 广播最终值）
+        for (const id of state.selectedIds) {
+          const initial = elementStatesBefore.current.get(id);
+          if (!initial) continue;
+          const finalEl = state.elements.find((el) => el.id === id);
+          if (!finalEl) continue;
+          // 关键修复：判断是否有变化（只有真正改过的元素才提交）
+          let hasChange = false;
+          for (const k of Object.keys(finalEl) as (keyof typeof finalEl)[]) {
+            if (k === "id" || k === "updatedAt") continue;
+            if (
+              JSON.stringify((finalEl as any)[k]) !==
+              JSON.stringify((initial as any)[k])
+            ) {
+              hasChange = true;
+              break;
+            }
+          }
+          if (!hasChange) continue;
+          // 计算 diff: final - initial
+          const updates: Partial<CanvasElement> = {};
+          for (const k of Object.keys(finalEl) as (keyof typeof finalEl)[]) {
+            if (k === "id" || k === "updatedAt") continue;
+            if (
+              JSON.stringify((finalEl as any)[k]) !==
+              JSON.stringify((initial as any)[k])
+            ) {
+              (updates as any)[k] = (finalEl as any)[k];
+            }
+          }
+          // 关键修复：调一次 updateElement（入栈 + 广播最终值）
+          // UpdateElementCommand 构造时 oldSnapshot=current（已经被 live 改成 final），
+          // newSnapshot=current+updates（=final），但 broadcastFields 强制带上 updates 字段，
+          // 所以 B 端能收到所有变化字段
+          state.updateElement(id, updates);
+        }
       }
       isTransforming.current = false;
       transformType.current = "none";

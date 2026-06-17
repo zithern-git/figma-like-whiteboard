@@ -6,12 +6,14 @@
  * 功能：
  * - 滚轮缩放：以鼠标位置为中心进行缩放，缩放范围 0.1x ~ 10x
  * - 空格+拖拽平移：按住空格键时拖拽鼠标平移画布
+ * - 空白处拖拽平移：选择工具下，鼠标在画布空白处按下并拖动时平移画布
+ *   （Figma 默认行为，避免与元素拖动 / 手柄 / 框选冲突）
  * - 缩放百分比实时显示
  *
  * 缩放原理：
  * 以鼠标位置为中心缩放意味着缩放后鼠标指向的世界坐标点保持不变。
  * 公式：newViewport.translateX = mouseX - (mouseX - oldViewport.translateX) * newZoom / oldZoom
- *       newViewport.translateY = mouseY - (mouseY - oldViewport.translateY) * newZoom / oldZoom
+ *       newViewport.translateY = mouseY - (mouseY - oldViewport.translateY) * newZoom / newZoom
  */
 
 import { useCallback, useRef, useEffect } from 'react'
@@ -76,6 +78,11 @@ export function useCanvasViewport(
    */
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // 避免在输入框中按空格时触发平移
+      const target = e.target as HTMLElement
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+        return
+      }
       if (e.code === 'Space' && !e.repeat) {
         e.preventDefault()
         isSpacePressed.current = true
@@ -97,6 +104,58 @@ export function useCanvasViewport(
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('keyup', handleKeyUp)
     }
+  }, [])
+
+  /**
+   * 开始平移（mousedown 时调用）
+   *
+   * 记录当前鼠标位置为基准点。空格+拖动 / 空白处拖动时调用。
+   *
+   * @param e - 鼠标事件
+   */
+  const handlePanStart = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!renderer) return
+      isPanning.current = true
+      const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
+      lastMousePos.current = {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      }
+    },
+    [renderer]
+  )
+
+  /**
+   * 平移中（mousemove 时调用）
+   *
+   * 用 dx/dy 调整视口 translateX/translateY（屏幕坐标 = 世界坐标 * zoom + translate，
+   * 所以视口位移 = 鼠标位移）。
+   */
+  const handlePanMove = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!renderer || !isPanning.current) return
+      e.preventDefault()
+      const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
+      const curX = e.clientX - rect.left
+      const curY = e.clientY - rect.top
+      const dx = curX - lastMousePos.current.x
+      const dy = curY - lastMousePos.current.y
+      lastMousePos.current = { x: curX, y: curY }
+      const viewport = renderer.getViewport()
+      renderer.setViewport({
+        translateX: viewport.translateX + dx,
+        translateY: viewport.translateY + dy,
+      })
+    },
+    [renderer]
+  )
+
+  /**
+   * 结束平移（mouseup 时调用）
+   */
+  const handlePanEnd = useCallback(() => {
+    isPanning.current = false
   }, [])
 
   /**
@@ -143,6 +202,9 @@ export function useCanvasViewport(
 
   return {
     handleWheel,
+    handlePanStart,
+    handlePanMove,
+    handlePanEnd,
     isPanning,
     isSpacePressed,
     lastMousePos,

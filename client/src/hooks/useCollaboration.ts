@@ -322,6 +322,10 @@ export function useCollaboration(whiteboardId: string | null): UseCollaborationR
               payload: { element: el },
               timestamp: Date.now(),
               userId: 'server',
+              // 关键修复：补全我之前加的 whiteboardId 必填字段。
+              // 这个 useCollaboration 路径在代码里没被实际使用（useSocketCollab 是主路径），
+              // 但 TS 类型要求必须传。
+              whiteboardId: whiteboardId ?? '',
             })
           }
         } else {

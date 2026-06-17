@@ -43,6 +43,54 @@ interface CursorPayload {
 const roomKey = (shortId: string) => `whiteboard:${shortId}`
 
 /**
+ * 关键修复（协作元素丢失 bug）：跨 socket 的 op 串行化。
+ *
+ * 之前每个 socket 内部用 opChain 串行化自己的 op，但**不同 socket 之间是并发执行
+ * 持久化的**。当 A 的 add X 和 B 的 add X 几乎同时到达时：
+ *   - A: pull X (无 X) → push X
+ *   - B: pull X (无 X) → push X
+ *   两个并发都执行，可能导致 A 的 add 被 B 的 pull 抹掉 → "少一个"元素
+ *
+ * 修复：维护一个 Map<roomKey, Promise>，每个 room 的 op 都 append 到该 room 的 chain 上。
+ * 这样无论多少客户端并发发 op，同一 room 的 op 在服务端是**严格按到达顺序**持久化的。
+ *
+ * 关键设计：
+ * - 串行化粒度是 room（不是 socket），保证不同用户协作时 op 有序
+ * - 串行化只影响持久化顺序，广播仍然是 fire-and-forget
+ * - Promise 异常隔离：单个 op 失败不影响后续 op
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const roomOpChains: Map<string, Promise<any>> = new Map()
+
+/**
+ * 把 op 串行化到指定 room 的执行链上。
+ * - 同一 room 的 op 严格按到达顺序执行 persistOp
+ * - 不同 room 的 op 完全独立（不会因为 room A 慢而阻塞 room B）
+ */
+function serializeOpForRoom(
+  shortId: string,
+  op: ElementOpPayload,
+  fn: (op: ElementOpPayload) => Promise<unknown>
+): Promise<unknown> {
+  const key = roomKey(shortId)
+  const prev = roomOpChains.get(key) ?? Promise.resolve()
+  const next = prev
+    .catch(() => {
+      // 关键修复：上一个 op 失败不应该阻断后续 op，重置 chain
+      return
+    })
+    .then(() => fn(op))
+  // 关键修复：保存新 chain（不 catch，让调用方处理错误）
+  // 但为了避免 unhandled rejection 污染进程，再用 swallow 包装存到 Map 的版本
+  const swallow = next.catch(() => {
+    // 错误已被调用方处理（socket.on('error') 监听），
+    // 这里只 swallow unhandled 警告
+  })
+  roomOpChains.set(key, swallow)
+  return next
+}
+
+/**
  * 验证用户对白板的访问权限
  * - 必须是 owner / collaborator 才允许加入
  * - viewer 角色可加入（可读），但写 op 会被 operationBroadcaster 拒绝
@@ -187,6 +235,18 @@ export function registerWhiteboardHandlers(io: Server, socket: Socket): void {
     }
   })
 
+  // ========== leave-all-rooms（关键修复：多白板切换串扰）==========
+  // 客户端在 cleanup 时调用，让服务端把当前 socket 从所有 whiteboard room 移除
+  socket.on('leave-all-rooms', async () => {
+    try {
+      for (const shortId of Array.from(joinedRooms)) {
+        await handleLeave(io, socket, shortId, userId, joinedRooms)
+      }
+    } catch (err) {
+      console.error('leave-all-rooms error:', err)
+    }
+  })
+
   // ========== element-op ==========
   socket.on('element-op', (op: ElementOpPayload) => {
     // 关键修复：用 opChain 串行化每个 op 的处理。
@@ -222,20 +282,25 @@ export function registerWhiteboardHandlers(io: Server, socket: Socket): void {
           return
         }
 
-        // 关键修复：打印 op 大小和类型，便于诊断图片上传失败 / 缓冲区溢出
-        const opSize = JSON.stringify(op).length
-        const payloadKb = (opSize / 1024).toFixed(1)
-        console.log(
-          `[element-op] user=${userId} shortId=${shortId} opType=${op.opType} payload=${payloadKb}KB clientOpId=${op.clientOpId}`
-        )
-
-        const result = await handleElementOp(io, socket, shortId, userId, op)
-        if (!result.allowed) {
-          socket.emit('error', {
-            code: result.rejectReason?.startsWith('FORBIDDEN') ? 'FORBIDDEN' : 'OP_REJECTED',
-            message: result.rejectReason ?? 'Op rejected',
-          })
-        }
+        // 关键修复（协作元素丢失 bug）：跨 socket 串行化同一 room 的 op。
+        // 这里把"持久化+广播"这一步放到 room 级别的 chain 上，
+        // 保证无论多少客户端并发，op 都按到达顺序落库。
+        // socket 内部 opChain 处理"同一 socket 的 op 串行"，
+        // room chain 处理"不同 socket 的 op 串行"，两者结合做到完全有序。
+        await serializeOpForRoom(shortId, op, async (opToProcess) => {
+          const opSize = JSON.stringify(opToProcess).length
+          const payloadKb = (opSize / 1024).toFixed(1)
+          console.log(
+            `[element-op] user=${userId} shortId=${shortId} opType=${opToProcess.opType} payload=${payloadKb}KB clientOpId=${opToProcess.clientOpId}`
+          )
+          const result = await handleElementOp(io, socket, shortId, userId, opToProcess)
+          if (!result.allowed) {
+            socket.emit('error', {
+              code: result.rejectReason?.startsWith('FORBIDDEN') ? 'FORBIDDEN' : 'OP_REJECTED',
+              message: result.rejectReason ?? 'Op rejected',
+            })
+          }
+        })
       })
       .catch((err) => {
         console.error('element-op error:', err)

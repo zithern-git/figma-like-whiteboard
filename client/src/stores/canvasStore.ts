@@ -23,8 +23,9 @@
 import { create } from 'zustand'
 import { nanoid } from 'nanoid'
 import { CanvasElement, ToolType, Viewport } from '@/canvas/CanvasElement'
-import { AddElementCommand, ClearAllElementsCommand, Command, CommandStore, DeleteElementCommand, UpdateElementCommand } from '@/utils/Command'
+import { AddElementCommand, ClearAllElementsCommand, Command, CommandStore, DeleteElementCommand, deserializeCommand, SerializedCommandData, UpdateElementCommand } from '@/utils/Command'
 import { UndoManager } from '@/utils/UndoManager'
+import { preloadImages } from '@/canvas/elementsStorage'
 
 // ========== 协作 op 协议（与服务端协议对齐） ==========
 
@@ -38,9 +39,11 @@ export interface ClientOp {
   timestamp: number
 }
 
-/** 服务端下行 op（带 userId） */
+/** 服务端下行 op（带 userId）。关键修复：必须带 whiteboardId 以便客户端过滤 */
 export interface ServerOp extends ClientOp {
   userId: string
+  /** 关键修复：服务端广播时附带 whiteboardId，客户端按此过滤 op 所属白板 */
+  whiteboardId: string
 }
 
 /**
@@ -87,8 +90,44 @@ interface CanvasState {
   deleteElement: (id: string) => void
   /** 更新元素 */
   updateElement: (id: string, updates: Partial<CanvasElement>) => void
-  /** 设置元素列表（用于初始化或全量替换，不入栈） */
-  setElements: (elements: CanvasElement[]) => void
+  /**
+   * 关键修复（滑动条拖动卡顿 / 拖动失败）：
+   * 拖动期间（例如调透明度、缩放、描边宽度）调用的"轻量更新"路径。
+   *
+   * 行为差异（与 updateElement 对比）：
+   * - 跳过 UndoManager.execute：拖动 0.5s 可能触发 30+ 次 onChange，
+   *   如果每个都入 undo 栈，用户按一次 Ctrl+Z 只能撤销 0.02 透明度，撤销体验崩溃
+   * - 跳过 _broadcastOp：拖动期间持续发 socket 会导致：
+   *   1) 每次都 JSON.stringify + 序列化（拖动 0.5s ≈ 30+ 次序列化，CPU 飙升）
+   *   2) 服务端按 op 顺序持久化 + 广播给其他用户，其他用户的画布也会"发抖"
+   *   3) 服务端可能被高频 op 拖垮
+   *   正确做法（Figma 也是）：拖动期间只更新本地画布预览，**松开时才发一次 op**
+   *
+   * 不入栈 + 不广播 ≠ 静默丢失：调用方应该在用户完成拖动时（PointerUp）再调一次
+   * updateElement 提交最终值，那次会入栈 + 广播。
+   *
+   * 命名（_live 后缀）：与 _raw 后缀保持一致风格（_raw 是 Command 重放专用），
+   * _live 是 UI 拖动期间专用。
+   */
+  _updateElementLive: (id: string, updates: Partial<CanvasElement>) => void
+  /**
+   * 设置元素列表（用于初始化或全量替换，不入栈）
+   * 关键修复（刷新后保留 undo 栈）：加 clearUndoStack 参数。
+   * - true（默认）：清空 undo 栈（socket ack / 协作同步等"权威源"场景）
+   * - false：保留 undo 栈（localStorage 恢复场景，保留用户的操作历史）
+   */
+  setElements: (elements: CanvasElement[], clearUndoStack?: boolean) => void
+  /**
+   * 关键修复（刷新后保留 undo 栈）：用序列化数据恢复 undo/redo 栈。
+   * 用于刷新后从 localStorage 加载栈，立即生效。
+   */
+  restoreUndoStack: (undoData: SerializedCommandData[], redoData?: SerializedCommandData[]) => void
+  /**
+   * 关键修复（刷新后保留 undo 栈）：导出当前 undo/redo 栈的序列化数据。
+   * 用于自动保存到 localStorage。
+   */
+  serializeUndoStack: () => SerializedCommandData[]
+  serializeRedoStack: () => SerializedCommandData[]
   /** 清空所有元素 */
   clearAllElements: () => void
 
@@ -247,14 +286,64 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     },
 
     /**
+     * 关键修复（滑动条拖动卡顿 / 拖动失败）：
+     * 拖动期间的"轻量更新"。跳过 UndoManager 和 _broadcastOp。
+     *
+     * 实现要点：
+     * - 直接用 _replaceElementRaw 写状态（Command 内部也是用这个）
+     * - 性能：避免每次深克隆 oldSnapshot（Command 构造时的 deepClone 也会执行）
+     *
+     * 重要：调用方在用户停止拖动时（PointerUp）必须再调一次 updateElement 提交最终值，
+     * 否则用户的修改**不会**进入 undo 栈、不会广播给协作者、不会被 UndoManager 记录。
+     */
+    _updateElementLive: (id, updates) => {
+      const current = self._getElementRaw(id)
+      if (!current) return
+      // 不做 deepClone：拖动期间频繁调用，深克隆一次 0.5-1ms（points 数组 / imageUrl 字符串），
+      // 30+ fps 下累计 30ms+ 阻塞主线程。直接用 ...spread + updates 即可（与 Command 内
+      // _replaceElementRaw 行为一致：replace 整张 snapshot，但更新字段少时性能更好）。
+      self._replaceElementRaw({ ...current, ...updates, updatedAt: Date.now() })
+    },
+
+    /**
      * setElements：直接全量替换，不入 undo 栈，不上行广播。
      * 用于：白板加载、协作同步的快照恢复等场景。
-     * 注意：调用前应清空 undo 栈（避免与历史不一致）。
+     *
+     * 关键修复（刷新后保留 undo 栈）：加 clearUndoStack 参数。
+     * - 默认 true：清空 undo 栈（socket ack 覆盖、协作同步等"权威源"场景）
+     * - false：保留 undo 栈（localStorage 恢复场景，保留用户的操作历史）
+     *
+     * 关键设计：清不清空 undo 栈由调用方决定，因为：
+     * 1) localStorage 恢复 → 用户期望 Ctrl+Z 仍然有效 → 不清空
+     * 2) socket ack 覆盖 → 权威源重置 → 清空 + 后续 restoreUndoStack 重建
+     * 3) 协作同步（如其他人清空画布）→ 应该清空
      */
-    setElements: (elements) => {
-      undoManager.clear()
+    setElements: (elements, clearUndoStack = true) => {
+      if (clearUndoStack) {
+        undoManager.clear()
+      }
       set({ elements })
     },
+
+    /**
+     * 关键修复（刷新后保留 undo 栈）：用序列化数据恢复 undo/redo 栈。
+     * 用于：刷新后从 localStorage 加载栈，立即生效。
+     * 注意：必须先 setElements（让 store 有正确的 elements 状态），
+     * 再 restoreUndoStack（让栈的 execute/undo 引用正确的 store 状态）。
+     */
+    restoreUndoStack: (undoData: SerializedCommandData[], redoData: SerializedCommandData[] = []) => {
+      // 反序列化为 Command 对象（传入 store 引用）
+      const undoCommands = undoData.map((d) => deserializeCommand(self, d))
+      const redoCommands = redoData.map((d) => deserializeCommand(self, d))
+      undoManager.restoreStacks(undoCommands, redoCommands)
+    },
+
+    /**
+     * 关键修复（刷新后保留 undo 栈）：导出当前栈的序列化数据。
+     * 用于：自动保存到 localStorage。
+     */
+    serializeUndoStack: (): SerializedCommandData[] => undoManager.serializeUndoStack(),
+    serializeRedoStack: (): SerializedCommandData[] => undoManager.serializeRedoStack(),
 
     clearAllElements: () => {
       undoManager.execute(
@@ -410,7 +499,26 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       switch (op.opType) {
         case 'add': {
           const el = op.payload?.element
-          if (el?.id) self._addElementRaw(el)
+          if (!el?.id) break
+          // 关键修复（B 端图片延迟看到 bug）：
+          // 在 add 元素到 store 之前，**立即预热图片**。
+          // 背景：
+          //   - A 上传图片后广播 add op，B 端收到 → _addElementRaw → store 改
+          //     → React re-render → Canvas useEffect [elements] → setElements
+          //     → markDirty('main') → 下一帧 renderMainLayer → loadImage
+          //     → new Image().src = url → HTTP GET
+          //   - 大图（几 MB）HTTP 下载需要几秒，期间 B 端看到"加载中..."占位符
+          //   - 用户感知"B 延迟一段时间才看到 A 上传的图"
+          // 修复：
+          //   - 预热用 fetch + new Image() 启动 HTTP 下载，**与 React 状态更新并行**
+          //   - 浏览器 image cache 基于 src URL 共享，CanvasRenderer.loadImage 后续
+          //     创建的 new Image() 会命中缓存，毫秒级 readyState = complete
+          //   - 移动/修改图片的 update op 不涉及 imageUrl，但仍调 preloadImages
+          //     防御（万一 imageUrl 字段被改：例如新上传替换源图）
+          if (el.type === 'image' && (el as { imageUrl?: string }).imageUrl) {
+            preloadImages([el])
+          }
+          self._addElementRaw(el)
           break
         }
         case 'update': {

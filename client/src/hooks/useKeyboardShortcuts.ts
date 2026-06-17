@@ -153,7 +153,7 @@ function exportCanvas(renderer: CanvasRenderer | null): void {
   if (!renderer) return
 
   // 获取当前视口信息
-  const viewport = renderer.getViewport()
+  void renderer.getViewport()
 
   // 创建离屏 Canvas 用于导出
   const exportCanvas = document.createElement('canvas')

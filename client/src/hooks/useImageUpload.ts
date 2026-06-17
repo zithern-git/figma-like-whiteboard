@@ -1,35 +1,31 @@
 /**
  * 图片上传 Hook (useImageUpload)
  *
- * 关键修复：补齐图片上传链路。CanvasRenderer 已经能渲染图片，
- * 但没有 UI 入口能往 imageUrl 写值。本 hook 提供：
- *
- * 1. 文件选择器上传：点击 Toolbar 的"图片"工具时，弹出系统文件选择器
- * 2. 拖拽上传：监听画布容器的 drop 事件
- * 3. 粘贴上传：监听 window 的 paste 事件
- *
- * 选中的图片经过 FileReader.readAsDataURL 转成 base64，
- * 按图片原始宽高创建 image 元素（过大时自动按比例缩小到 800x600 边界内）。
+ * 关键设计（Phase 8）：
+ * - 走服务端 /api/upload：上传成功后会得到一个稳定的 URL（如 /uploads/abc.png）
+ *   - 协作时 URL 不会因为 base64 编码差异而同步失败
+ *   - 大图片不会撑爆 Socket.IO 帧（base64 路径已被替代）
+ * - 失败 / 离线时降级到 base64：保证任何场景下用户都能继续编辑
+ * - 创建的 image 元素自然尺寸即 width/height，Shift 锁比例在 useElementTransform 中实现
  *
  * 边界情况处理：
- * - 超大图片（>10MB）：前端用 OffscreenCanvas / Canvas 重新绘制为 JPEG 压缩
- *   - 避免 base64 序列化后帧大小超限（Socket.IO 单帧 20MB）
- *   - 避免过大的 dataURL 占用 localStorage / IndexedDB
- * - 自动旋转（EXIF）：TODO 暂不处理
+ * - 超大图片（>10MB）：前端用 OffscreenCanvas 重新绘制为 JPEG 压缩后再上传
+ *   - 避免服务端收到超大文件触发 multer 413
+ *   - JPEG 质量 0.85 通常能把 10MB PNG 压到 1-2MB
+ * - 上传失败：自动降级到 base64，让用户体验不被打断
+ * - 离屏（isVisible=false）：仍然允许上传，只是网络可能慢
  */
 
 import { useCallback, useRef } from "react";
 import { CanvasRenderer } from "@/canvas/CanvasRenderer";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { toast } from "@/stores/toastStore";
+import api from "@/services/api";
 
-/** 图片最大显示尺寸（保持宽高比）
- * 关键修复：800 → 600。base64 dataURL 长度 ≈ 4/3 × (W × H × 4) 字节。
- * 600×600 图大约 1.1MB，加上 Socket.IO 帧头在 20MB 缓冲区内安全。
- */
-const MAX_IMAGE_DIMENSION = 600;
+/** 图片最大显示尺寸（保持宽高比） */
+const MAX_IMAGE_DIMENSION = 800;
 
-/** 触发前端压缩的文件大小阈值（10MB） */
+/** 触发前端压缩的文件大小阈值（10MB，对齐服务端 multer 限制） */
 const COMPRESS_THRESHOLD_BYTES = 10 * 1024 * 1024;
 
 /** JPEG 压缩质量（0~1） */
@@ -42,70 +38,91 @@ export function useImageUpload(renderer: CanvasRenderer | null) {
   const lastPosRef = useRef<{ x: number; y: number } | null>(null);
 
   /**
-   * 把 File 转成 dataURL，并创建 image 元素加到画布
+   * 把 File 转成可用的 imageUrl，并创建 image 元素加到画布
+   *
+   * 工作流程：
+   * 1. 校验文件类型
+   * 2. 选择数据源：
+   *    - 小文件（<=10MB）→ 直接 POST /api/upload
+   *    - 大文件 → 前端先压缩为 JPEG，再 POST /api/upload
+   *    - 失败 → 降级为 base64 dataURL
+   * 3. 按图片自然宽高创建 image 元素（保持宽高比）
+   * 4. 自动选中新图片
    *
    * @param file - 选中的图片文件
    * @param worldPos - 元素左上角的世界坐标；不传则放在视口中心
    */
   const handleFile = useCallback(
-    (file: File, worldPos?: { x: number; y: number }) => {
+    async (file: File, worldPos?: { x: number; y: number }) => {
       if (!file.type.startsWith("image/")) {
         toast.warning("请选择图片文件");
         return;
       }
 
-      // 关键修复：超大图片（>10MB）走前端压缩路径
-      // 1. FileReader 读出 dataURL
-      // 2. 用 Image 解码
-      // 3. 用 OffscreenCanvas / Canvas 重绘为 JPEG（dataURL 体积大幅下降）
-      // 4. 转回 dataURL 后再走 addElement
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        const dataUrl = ev.target?.result as string;
-        if (!dataUrl) return;
+      const state = useCanvasStore.getState();
 
-        const probe = new Image();
-        probe.onload = () => {
-          const state = useCanvasStore.getState();
+      // 第 1 步：探测图片自然尺寸
+      const dataUrl = await readFileAsDataURL(file)
+      if (!dataUrl) {
+        toast.error("文件读取失败")
+        return
+      }
+      const probe = await loadImage(dataUrl)
+      let w = probe.naturalWidth
+      let h = probe.naturalHeight
+      if (w === 0 || h === 0) {
+        toast.error("图片加载失败")
+        return
+      }
 
-          // 等比缩放到 MAX_IMAGE_DIMENSION 之内
-          let w = probe.naturalWidth;
-          let h = probe.naturalHeight;
-          if (w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION) {
-            const scale = Math.min(
-              MAX_IMAGE_DIMENSION / w,
-              MAX_IMAGE_DIMENSION / h
-            );
-            w = Math.round(w * scale);
-            h = Math.round(h * scale);
-          }
+      // 等比缩放到 MAX_IMAGE_DIMENSION 之内（保宽高比）
+      if (w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION) {
+        const scale = Math.min(
+          MAX_IMAGE_DIMENSION / w,
+          MAX_IMAGE_DIMENSION / h
+        )
+        w = Math.round(w * scale)
+        h = Math.round(h * scale)
+      }
 
-          // 关键修复：>10MB 文件触发压缩走重绘流程
-          // 重绘为 JPEG 后，base64 体积通常下降 70%+
-          if (file.size > COMPRESS_THRESHOLD_BYTES) {
-            compressImage(dataUrl, w, h)
-              .then((compressedDataUrl) => {
-                addImageElement(state, compressedDataUrl, w, h, worldPos, renderer, file);
-              })
-              .catch((err) => {
-                console.error("[useImageUpload] 压缩失败:", err);
-                toast.error("图片压缩失败，使用原图");
-                addImageElement(state, dataUrl, w, h, worldPos, renderer, file);
-              });
-            return;
-          }
+      // 第 2 步：决定上传数据
+      let imageUrl = dataUrl
+      let uploaded = false
 
-          addImageElement(state, dataUrl, w, h, worldPos, renderer, file);
-        };
-        probe.onerror = () => {
-          toast.error("图片加载失败");
-        };
-        probe.src = dataUrl;
-      };
-      reader.onerror = () => {
-        toast.error("文件读取失败");
-      };
-      reader.readAsDataURL(file);
+      if (file.size > COMPRESS_THRESHOLD_BYTES) {
+        // 大文件：先压缩再上传
+        try {
+          const compressed = await compressImage(dataUrl, w, h)
+          imageUrl = await uploadToServer(compressed, file.name)
+          uploaded = true
+          toast.success(`已添加图片（${(file.size / 1024 / 1024).toFixed(1)}MB，已自动压缩）`)
+        } catch (err) {
+          console.error("[useImageUpload] 压缩/上传失败，降级到 base64:", err)
+          // 降级：直接用 dataURL
+        }
+      } else {
+        // 小文件：直接上传
+        try {
+          imageUrl = await uploadToServer(dataUrl, file.name)
+          uploaded = true
+        } catch (err) {
+          console.warn("[useImageUpload] 上传失败，降级到 base64:", err)
+          // 降级：使用 dataURL
+        }
+      }
+
+      // 第 3 步：创建 image 元素
+      addImageElement(state, imageUrl, w, h, worldPos, renderer)
+      if (!uploaded) {
+        toast.info("已添加图片（离线模式，未上传至服务器）")
+      }
+
+      // 关键修复：图片添加完成后切回 select 工具
+      // 之前由 WhiteboardPage 的 useEffect 在 activeTool === 'image' 时切回，
+      // 但该 useEffect 同时调用 openFilePicker()，导致与 Toolbar 里的调用重复，
+      // 第二次 click() 被浏览器排队，在用户关闭第一次对话框后再次弹出。
+      // 改在文件处理完成时切回：单点触发、无副作用、时序确定。
+      useCanvasStore.getState().setTool("select")
     },
     [renderer]
   );
@@ -196,6 +213,30 @@ export function useImageUpload(renderer: CanvasRenderer | null) {
   };
 }
 
+// ============================================================
+// 工具函数
+// ============================================================
+
+/** 读 File → dataURL */
+function readFileAsDataURL(file: File): Promise<string> {
+  return new Promise((resolve) => {
+    const reader = new FileReader()
+    reader.onload = (ev) => resolve((ev.target?.result as string) || "")
+    reader.onerror = () => resolve("")
+    reader.readAsDataURL(file)
+  })
+}
+
+/** 加载图片（Promise 版） */
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error("Image load failed"))
+    img.src = src
+  })
+}
+
 /**
  * 压缩图片为 JPEG dataURL
  *
@@ -207,74 +248,124 @@ async function compressImage(
   width: number,
   height: number
 ): Promise<string> {
-  const img = new Image();
-  await new Promise<void>((resolve, reject) => {
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error("Image load failed"));
-    img.src = dataUrl;
-  });
+  const img = await loadImage(dataUrl)
 
   // 优先用 OffscreenCanvas（worker 友好，性能更好）
   const useOffscreen =
     typeof OffscreenCanvas !== "undefined" &&
-    typeof (OffscreenCanvas.prototype as unknown as { convertToBlob?: unknown }).convertToBlob === "function";
+    typeof (OffscreenCanvas.prototype as unknown as { convertToBlob?: unknown }).convertToBlob === "function"
 
   if (useOffscreen) {
-    const off = new OffscreenCanvas(width, height);
-    const ctx = off.getContext("2d");
-    if (!ctx) throw new Error("OffscreenCanvas 2d context unavailable");
-    ctx.drawImage(img, 0, 0, width, height);
-    // convertToBlob 在标准 lib.dom 里可用，但 TS 严格模式可能不识别，用类型断言
+    const off = new OffscreenCanvas(width, height)
+    const ctx = off.getContext("2d")
+    if (!ctx) throw new Error("OffscreenCanvas 2d context unavailable")
+    ctx.drawImage(img, 0, 0, width, height)
     const blob = await (off as unknown as {
-      convertToBlob: (opts: { type: string; quality: number }) => Promise<Blob>;
-    }).convertToBlob({ type: "image/jpeg", quality: COMPRESS_QUALITY });
-    return await blobToDataURL(blob);
+      convertToBlob: (opts: { type: string; quality: number }) => Promise<Blob>
+    }).convertToBlob({ type: "image/jpeg", quality: COMPRESS_QUALITY })
+    return await blobToDataURL(blob)
   }
 
   // Fallback：普通 Canvas
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Canvas 2d context unavailable");
-  ctx.drawImage(img, 0, 0, width, height);
-  return canvas.toDataURL("image/jpeg", COMPRESS_QUALITY);
+  const canvas = document.createElement("canvas")
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext("2d")
+  if (!ctx) throw new Error("Canvas 2d context unavailable")
+  ctx.drawImage(img, 0, 0, width, height)
+  return canvas.toDataURL("image/jpeg", COMPRESS_QUALITY)
 }
 
-/** Blob → dataURL（仅 OffscreenCanvas 路径需要，普通 Canvas 走 toDataURL 一步到位） */
+/** Blob → dataURL */
 function blobToDataURL(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(new Error("Blob read failed"));
-    reader.readAsDataURL(blob);
-  });
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = () => reject(new Error("Blob read failed"))
+    reader.readAsDataURL(blob)
+  })
 }
 
-/** 把图片元素加到画布（供压缩 / 非压缩两个分支共用） */
+/**
+ * dataURL → Blob（用于上传时节省编码） */
+function dataURLToBlob(dataUrl: string): Blob {
+  const [header, base64] = dataUrl.split(",", 2)
+  const mimeMatch = header.match(/data:([^;]+);base64/)
+  const mime = mimeMatch ? mimeMatch[1] : "image/png"
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return new Blob([bytes], { type: mime })
+}
+
+/**
+ * 上传到服务端 /api/upload
+ *
+ * 成功时返回稳定的 URL（相对路径，如 /uploads/abc.png）；
+ * 失败抛错，由调用方降级到 base64 路径。
+ */
+async function uploadToServer(dataUrl: string, filename: string): Promise<string> {
+  const blob = dataURLToBlob(dataUrl)
+  const formData = new FormData()
+  // 保留原扩展名（如果能从 mime 推出来）
+  const ext = blob.type.split("/")[1] || "png"
+  formData.append("file", blob, filename || `image.${ext}`)
+
+  const res = await api.post<{ success: true; data: { url: string } }>(
+    "/upload",
+    formData,
+    {
+      // 关键修复：绝对不要手动设置 Content-Type: multipart/form-data！
+      // axios 在检测到 FormData body 时会自动生成带 boundary 的
+      // Content-Type: multipart/form-data; boundary=----xxx，
+      // boundary 是 multer 解析 multipart 各个 part 的关键分隔符。
+      // 手动写死成 "multipart/form-data"（没有 boundary）会让请求体格式
+      // 不合法，后端 multer 解析失败 → ERR_CONNECTION_RESET → 上传失败降级到 base64。
+      //
+      // silent: true — 上传失败时不弹错误 toast：
+      //   1) 我们有完整的 base64 降级路径（下方 catch 兜底），图片仍能正常加入画布
+      //   2) 失败时调用方会显示"已添加图片（离线模式，未上传至服务器）"的 info toast
+      //   3) 弹错误 toast 会和"成功添加"形成冲突，让用户误以为操作失败
+      // 注意：服务端错误（非 4xx/5xx 的网络错误）仍会被 axios 拦截器记录到 console
+      silent: true,
+    }
+  )
+  if (!res.data?.success) {
+    throw new Error("[useImageUpload] 服务端返回失败")
+  }
+  return res.data.data.url
+}
+
+/**
+ * 把图片元素加到画布
+ *
+ * 关键修复：保留宽高比 - 调用方传入的 w/h 已经是等比缩放后的尺寸，
+ * 创建 image 元素时直接使用，保证 Shift 锁比例拖拽时的初始比例正确。
+ */
 function addImageElement(
   state: ReturnType<typeof useCanvasStore.getState>,
-  dataUrl: string,
+  imageUrl: string,
   w: number,
   h: number,
   worldPos: { x: number; y: number } | undefined,
-  renderer: CanvasRenderer | null,
-  file: File
+  renderer: CanvasRenderer | null
 ) {
   // 计算放置位置：优先用传入的 worldPos，其次用视口中心
-  let posX = 0;
-  let posY = 0;
+  let posX = 0
+  let posY = 0
   if (worldPos) {
-    posX = worldPos.x;
-    posY = worldPos.y;
+    posX = worldPos.x
+    posY = worldPos.y
   } else if (renderer) {
-    const v = renderer.getViewport();
+    const v = renderer.getViewport()
     // 通过 renderer 暴露的 mainCanvas（私有字段）取得容器尺寸
-    const mainCanvas = (renderer as unknown as { mainCanvas?: HTMLCanvasElement }).mainCanvas;
-    const cw = mainCanvas ? mainCanvas.clientWidth : window.innerWidth;
-    const ch = mainCanvas ? mainCanvas.clientHeight : window.innerHeight;
-    posX = (cw / 2 - v.translateX) / v.zoom - w / 2;
-    posY = (ch / 2 - v.translateY) / v.zoom - h / 2;
+    const mainCanvas = (renderer as unknown as { mainCanvas?: HTMLCanvasElement }).mainCanvas
+    const cw = mainCanvas ? mainCanvas.clientWidth : window.innerWidth
+    const ch = mainCanvas ? mainCanvas.clientHeight : window.innerHeight
+    posX = (cw / 2 - v.translateX) / v.zoom - w / 2
+    posY = (ch / 2 - v.translateY) / v.zoom - h / 2
   }
 
   const imageEl = state.createElement("image", {
@@ -282,14 +373,20 @@ function addImageElement(
     y: posY,
     width: w,
     height: h,
-    imageUrl: dataUrl,
-  });
-  state.addElement(imageEl);
-  // 创建后自动选中新图片
-  state.setSelectedIds(new Set([imageEl.id]));
-
-  // 用户反馈：文件越大提示越明显
-  if (file.size > COMPRESS_THRESHOLD_BYTES) {
-    toast.success(`已添加图片（${(file.size / 1024 / 1024).toFixed(1)}MB，已自动压缩）`);
+    imageUrl,
+  })
+  // 关键修复（A 端上传后立即看到图，无占位符闪烁）：
+  // A 端 imageUrl 可能是服务端返回的 URL（首次访问需要 HTTP GET）
+  // 也可能是 base64 dataURL（降级路径，浏览器立即可读）。
+  // 对 HTTP URL 场景，立即 preloadImages 触发 HTTP 缓存预热，
+  // 让 CanvasRenderer.loadImage 后续创建 new Image() 时命中缓存，毫秒级 ready。
+  if (imageUrl.startsWith("http") || imageUrl.startsWith("/")) {
+    // 关键修复：动态 import 避免循环依赖（elementsStorage 不依赖 useImageUpload）
+    void import("@/canvas/elementsStorage").then(({ preloadImages }) => {
+      preloadImages([imageEl])
+    })
   }
+  state.addElement(imageEl)
+  // 创建后自动选中新图片，方便用户立即拖动或调整
+  state.setSelectedIds(new Set([imageEl.id]))
 }

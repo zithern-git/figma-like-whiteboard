@@ -44,7 +44,24 @@ export interface Command {
   batchId?: string
   execute(): void
   undo(): void
+  /**
+   * 关键修复（刷新后保留 undo 栈）：序列化为纯 JSON 数据。
+   * 用于把 undo 栈持久化到 localStorage，刷新后恢复。
+   * 不含 store 引用 / 方法回调，仅含可还原状态的快照数据。
+   */
+  serialize(): SerializedCommandData
 }
+
+/**
+ * 可序列化的命令数据（纯 JSON）。
+ * 用于跨刷新持久化 undo 栈。
+ */
+export type SerializedCommandData =
+  | { type: 'add'; batchId?: string; element: CanvasElement }
+  | { type: 'delete'; batchId?: string; snapshot: CanvasElement }
+  | { type: 'update'; batchId?: string; oldSnapshot: CanvasElement; newSnapshot: CanvasElement }
+  | { type: 'clear-all'; batchId?: string; snapshot: CanvasElement[] }
+  | { type: 'batch'; batchId?: string; cmds: SerializedCommandData[] }
 
 /**
  * Command 所需的"低层 store 能力"接口
@@ -75,7 +92,7 @@ export interface CommandStore {
 export type ElementSnapshot = CanvasElement
 
 /** 深拷贝（仅 CanvasElement 自身的可枚举字段） */
-function deepClone<T>(value: T): T {
+export function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value))
 }
 
@@ -117,6 +134,14 @@ export class AddElementCommand implements Command {
     // 关键修复：撤销 add 也要广播对应 'delete' op
     this.store._broadcastOp(makeOp('delete', { id: this.element.id }))
   }
+
+  serialize(): SerializedCommandData {
+    return {
+      type: 'add',
+      batchId: this.batchId,
+      element: deepClone(this.element),
+    }
+  }
 }
 
 /**
@@ -147,6 +172,14 @@ export class DeleteElementCommand implements Command {
     this.store._addElementRaw(deepClone(this.snapshot))
     this.store._broadcastOp(makeOp('add', { element: this.snapshot }))
   }
+
+  serialize(): SerializedCommandData {
+    return {
+      type: 'delete',
+      batchId: this.batchId,
+      snapshot: deepClone(this.snapshot),
+    }
+  }
 }
 
 /**
@@ -160,6 +193,21 @@ export class UpdateElementCommand implements Command {
   batchId?: string
   private oldSnapshot: ElementSnapshot
   private newSnapshot: ElementSnapshot
+  /**
+   * 关键修复（协作透明 / 圆角丢失 bug）：用户显式传入的字段集合。
+   *
+   * 背景：拖动滑动条时，`_updateElementLive` 会持续改 store 并写 `updatedAt: Date.now()`。
+   * 拖动结束时 PointerUp 调 `updateElement` 构造本命令，但此时：
+   *   - `oldSnapshot` 从 store 读出的 current **已经是拖动最终值**
+   *   - `newSnapshot` 又是基于 current + 同样的 updates + 新 updatedAt
+   *   - `diffSnapshots` 算出 updates 只含 `updatedAt`，**不含用户实际改的字段**
+   *   - 广播给 B 后，B 端 `_applyRemoteOp` 用 `{...current, ...updates}` merge，
+   *     没拿到 opacity/cornerRadius，B 看不到 + 刷新也看不到
+   *
+   * 修复：记录构造时用户传入的字段名，execute/undo 广播时**强制带上**这些字段，
+   * 不依赖 diffSnapshots 的结果。
+   */
+  private broadcastFields: Set<string>
 
   /**
    * 暴露只读 id：UndoManager 在 batch 合并时需要按 id 匹配已有的同元素命令。
@@ -174,6 +222,7 @@ export class UpdateElementCommand implements Command {
     id: string,
     updates: Partial<CanvasElement>
   ) {
+    this.broadcastFields = new Set(Object.keys(updates))
     const current = this.store._getElementRaw(id)
     if (!current) {
       // 元素不存在：构造一个空壳，execute/undo 不会真正生效
@@ -192,9 +241,9 @@ export class UpdateElementCommand implements Command {
     this.store._broadcastOp(
       makeOp('update', {
         id: this.newSnapshot.id,
-        // 关键修复：广播差集字段（new - old），接收方做 merge。
-        // 增量字段越小越节省带宽
-        updates: diffSnapshots(this.oldSnapshot, this.newSnapshot),
+        // 关键修复：广播差集 + 用户显式传入字段，接收方做 merge。
+        // 强制带上 broadcastFields 解决滑动条拖动后字段丢失的问题。
+        updates: this.computeBroadcastUpdates(this.oldSnapshot, this.newSnapshot),
       })
     )
   }
@@ -206,10 +255,31 @@ export class UpdateElementCommand implements Command {
     this.store._broadcastOp(
       makeOp('update', {
         id: this.oldSnapshot.id,
-        // 反向差集：old - new（撤销时回到 old，所以 updates 应是 old 的字段）
-        updates: diffSnapshots(this.newSnapshot, this.oldSnapshot),
+        // 反向：撤销时回到 old，所以 updates 应是 old 的字段
+        // 但 broadcastFields 是同一个集合（用户传入的字段名），
+        // 撤销时也要把这些字段恢复到 old 端的值
+        updates: this.computeBroadcastUpdates(this.newSnapshot, this.oldSnapshot),
       })
     )
+  }
+
+  /**
+   * 关键修复：构造广播 updates。
+   * - 基础：diffSnapshots(from, to) 节省带宽
+   * - 强制覆盖：用户显式传入的字段（broadcastFields）从 to 端取值
+   *   覆盖 diff 结果（解决 _updateElementLive 期间 store 已被改写导致 diff 丢失原字段的问题）
+   */
+  private computeBroadcastUpdates(
+    from: ElementSnapshot,
+    to: ElementSnapshot
+  ): Partial<CanvasElement> {
+    const updates: any = diffSnapshots(from, to)
+    for (const k of this.broadcastFields) {
+      if (k === 'id') continue
+      // 强制用 to 端的值（execute 时 to=newSnapshot，undo 时 to=oldSnapshot）
+      updates[k] = (to as any)[k]
+    }
+    return updates
   }
 
   /**
@@ -234,6 +304,15 @@ export class UpdateElementCommand implements Command {
     other.newSnapshot = deepClone(this.newSnapshot)
     return true
   }
+
+  serialize(): SerializedCommandData {
+    return {
+      type: 'update',
+      batchId: this.batchId,
+      oldSnapshot: deepClone(this.oldSnapshot),
+      newSnapshot: deepClone(this.newSnapshot),
+    }
+  }
 }
 
 /** 浅 diff：取 from 中与 to 不同的字段作为 updates（包含 to 端的最新值） */
@@ -243,7 +322,10 @@ function diffSnapshots(
 ): Partial<CanvasElement> {
   const updates: any = {}
   for (const k of Object.keys(to) as (keyof CanvasElement)[]) {
-    if (k === 'id') continue
+    // 关键修复：忽略 id 和 updatedAt。
+    // - id 不会变
+    // - updatedAt 每次 _updateElementLive / 构造命令时都会重新写，对端不应该被覆盖
+    if (k === 'id' || k === 'updatedAt') continue
     if (JSON.stringify((from as any)[k]) !== JSON.stringify((to as any)[k])) {
       updates[k] = (to as any)[k]
     }
@@ -279,6 +361,14 @@ export class ClearAllElementsCommand implements Command {
       this.store._broadcastOp(makeOp('add', { element: deepClone(el) }))
     }
   }
+
+  serialize(): SerializedCommandData {
+    return {
+      type: 'clear-all',
+      batchId: this.batchId,
+      snapshot: deepClone(this.snapshot),
+    }
+  }
 }
 
 /**
@@ -306,10 +396,74 @@ export class BatchCommand implements Command {
   execute(): void {
     for (const c of this.cmds) c.execute()
   }
-
   undo(): void {
     for (let i = this.cmds.length - 1; i >= 0; i--) {
       this.cmds[i].undo()
+    }
+  }
+
+  /**
+   * 关键修复（刷新后保留 undo 栈）：批量命令的序列化。
+   * 递归序列化每个子命令。
+   * 注意：序列化时调用的是子命令的 serialize()，所以子命令的 store
+   * 引用不会被保留。
+   */
+  serialize(): SerializedCommandData {
+    return {
+      type: 'batch',
+      batchId: this.batchId,
+      cmds: this.cmds.map((c) => c.serialize()),
+    }
+  }
+}
+
+/**
+ * 关键修复（刷新后保留 undo 栈）：把序列化数据反序列化为 Command 对象。
+ * 注意：必须传入 store 引用，因为 Command 的 execute/undo 需要操作 store。
+ *
+ * @param store - CommandStore 接口实现（通常是 canvasStore 暴露的 self）
+ * @param data - 序列化数据
+ * @returns 反序列化后的 Command 对象
+ */
+export function deserializeCommand(
+  store: CommandStore,
+  data: SerializedCommandData
+): Command {
+  switch (data.type) {
+    case 'add': {
+      const cmd = new AddElementCommand(store, deepClone(data.element))
+      cmd.batchId = data.batchId
+      return cmd
+    }
+    case 'delete': {
+      // DeleteElementCommand 构造时从 element 拍快照，我们传 data.snapshot
+      const cmd = Object.create(DeleteElementCommand.prototype) as DeleteElementCommand
+      // 直接设置 snapshot 字段（绕过构造函数）
+      ;(cmd as any).snapshot = deepClone(data.snapshot)
+      ;(cmd as any).store = store
+      cmd.batchId = data.batchId
+      return cmd
+    }
+    case 'update': {
+      const cmd = Object.create(UpdateElementCommand.prototype) as UpdateElementCommand
+      ;(cmd as any).store = store
+      ;(cmd as any).oldSnapshot = deepClone(data.oldSnapshot)
+      ;(cmd as any).newSnapshot = deepClone(data.newSnapshot)
+      cmd.batchId = data.batchId
+      return cmd
+    }
+    case 'clear-all': {
+      const cmd = Object.create(ClearAllElementsCommand.prototype) as ClearAllElementsCommand
+      ;(cmd as any).snapshot = deepClone(data.snapshot)
+      ;(cmd as any).store = store
+      cmd.batchId = data.batchId
+      return cmd
+    }
+    case 'batch': {
+      // 递归反序列化子命令
+      const subCmds = data.cmds.map((c) => deserializeCommand(store, c))
+      const cmd = new BatchCommand(data.batchId || 'restored', subCmds)
+      return cmd
     }
   }
 }

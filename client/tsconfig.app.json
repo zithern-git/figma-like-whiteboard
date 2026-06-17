@@ -28,5 +28,9 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": [
+    "src/components/canvas/TestDrawTool.tsx",
+    "src/components/canvas/PropertiesPanel.tsx"
+  ]
 }

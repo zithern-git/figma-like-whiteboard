@@ -10,6 +10,7 @@
 import cors from 'cors'
 import express, { NextFunction, Request, Response } from 'express'
 import { createServer } from 'http'
+import path from 'path'
 import {
   AppError,
   errorHandler,
@@ -18,6 +19,7 @@ import {
 import authRoutes from './routes/authRoutes'
 import whiteboardRoutes from './routes/whiteboardRoutes'
 import snapshotRoutes from './routes/snapshotRoutes'
+import uploadRoutes from './routes/uploadRoutes'
 import { initializeSocket } from './sockets'
 
 const app = express()
@@ -60,6 +62,20 @@ app.get('/api/health', (_req, res) => {
 app.use('/api/auth', authRoutes)
 app.use('/api/whiteboards', whiteboardRoutes)
 app.use('/api/whiteboards', snapshotRoutes)
+app.use('/api/upload', uploadRoutes)
+
+// 静态文件服务：上传的图片通过 /uploads/* 访问
+// 路径在 server/public/uploads/，与 uploadRoutes.UPLOAD_DIR 对应
+app.use(
+  '/uploads',
+  express.static(path.resolve(__dirname, '../public/uploads'), {
+    maxAge: '7d', // 浏览器缓存 7 天
+    setHeaders: (res) => {
+      // 允许跨域读取（图片资源）
+      res.setHeader('Access-Control-Allow-Origin', '*')
+    },
+  })
+)
 
 // 404 handler：所有路由未匹配时触发
 app.use(notFoundHandler)

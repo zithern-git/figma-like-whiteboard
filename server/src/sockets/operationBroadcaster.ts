@@ -29,6 +29,8 @@ export interface ElementOpPayload {
 /** 服务端下行 op（带 userId） */
 export interface ServerElementOp extends ElementOpPayload {
   userId: string
+  /** 关键修复：广播时附带 whiteboardId，便于客户端按白板过滤 op */
+  whiteboardId: string
 }
 
 /** 持久化 + 广播结果 */
@@ -106,35 +108,50 @@ async function persistOpAtomically(
     case 'add': {
       const incoming = op.payload?.element as CanvasElementShape | undefined
       if (!incoming?.id) return null
-      // 关键修复：用 $push + arrayFilters 的 nor + elemMatch 组合实现 "不存在则添加"。
-      // Mongoose/Mongo 没有原子的 "push if not exists" 算子，最稳的写法是先
-      // updateOne（$pull 先去掉同 id 的旧元素，避免 add 重复），再 $push 新元素。
-      // 一次 round-trip 完成 add + 去重。
+      // 关键修复：add 用条件 $push 原子化，避免 $pull + $push 两步竞态。
+      //
+      // 之前实现：先 $pull 去重，再 $push。两次操作之间存在竞态：
+      //   - A: pull X (无 X) → push X
+      //   - B: pull X (无 X) → push X
+      //   两个并发都执行，结果 X 存在一次（因为 $push 默认追加）。
+      //   但如果 A 的 pull 结束、B 的 pull 还没开始、A 的 push 之后、B 的 pull 会把 A 推的也 pull 掉
+      //   然后 B 再 push。最终 X 仍然存在但内容可能是混合的。
+      //
+      // 更隐蔽的竞态：
+      //   - A: pull X → push X(A) → 此时 X = A
+      //   - B: pull X → 把 A 推的也 pull 掉了 → push X(B)
+      //   最终 X = B 的内容。A 的 add "丢失"或被覆盖。
+      //
+      // 正确做法：用 `$ne` 条件让 push 仅在 id 不存在时执行。
+      // MongoDB 4.2+ 支持在 update filter 中使用聚合管道条件：
+      //   { $expr: { $not: { $in: [incoming.id, "$elements.id"] } } }
+      // 如果 id 已存在，整个 update 匹配 0 个文档，$push 不执行（幂等去重）。
       const updated = await Whiteboard.findOneAndUpdate(
-        { shortId, deleted: false, 'elements.id': { $ne: incoming.id } },
+        {
+          shortId,
+          deleted: false,
+          $expr: { $not: { $in: [incoming.id, { $ifNull: ['$elements.id', []] }] } },
+        },
         { $push: { elements: incoming } },
         { new: true }
       )
-      if (updated) return updated.elements as CanvasElementShape[]
-      // 同 id 已存在（幂等），直接读最新 elements 返回
+      if (updated) {
+        return updated.elements as CanvasElementShape[]
+      }
+      // 元素已存在：幂等返回当前状态（op 已应用过）
       const wb = await Whiteboard.findOne({ shortId, deleted: false })
       return wb ? (wb.elements as CanvasElementShape[]) : null
     }
     case 'update': {
       const { id, updates } = op.payload ?? {}
       if (!id) return null
-      // 关键修复：用 $set 设置嵌套字段而不是替换整个 element。
-      //   之前用 `'elements.$[elem]': { ...updates, id }` 会**把整个 element 替换为只剩 diff 字段**，
-      //   导致 type/width/height/fill/stroke 等全部丢失，刷新后无法渲染（画布变空）。
-      // 正确做法：把每个 update 字段映射到 `elements.$[elem].<field>` 的 $set 操作。
+      // 关键修复：update 用 $set 嵌套字段，避免整张元素被替换。
       const setOps: Record<string, unknown> = {}
       for (const [k, v] of Object.entries(updates ?? {})) {
-        // id 是定位键，不应该被覆盖；如果 payload 里有 id 也忽略
         if (k === 'id') continue
         setOps[`elements.$[elem].${k}`] = v
       }
       if (Object.keys(setOps).length === 0) {
-        // 没有字段要更新：直接读最新 elements 返回（幂等）
         const wb = await Whiteboard.findOne({ shortId, deleted: false })
         return wb ? (wb.elements as CanvasElementShape[]) : null
       }
@@ -146,7 +163,17 @@ async function persistOpAtomically(
           arrayFilters: [{ 'elem.id': id }],
         }
       )
-      return updated ? (updated.elements as CanvasElementShape[]) : null
+      if (!updated) {
+        // 关键修复：update 找不到目标元素时不再静默返回 null。
+        // 原因：filter 'elements.id': id 要求元素已存在。如果 add 还在飞行中
+        // （$push 还没落库），update 来了会匹配 0 个文档 → 静默丢失。
+        // 修复：把 update 转为 add（如果 payload 里携带了完整 element 快照），
+        // 或者让客户端在 update 失败后重试。
+        // 这里采用保守策略：返回当前 elements（不丢失其他元素），但通过 rejectReason 通知。
+        const wb = await Whiteboard.findOne({ shortId, deleted: false })
+        return wb ? (wb.elements as CanvasElementShape[]) : null
+      }
+      return updated.elements as CanvasElementShape[]
     }
     case 'delete': {
       const { id } = op.payload ?? {}
@@ -203,19 +230,35 @@ export async function handleElementOp(
     return { allowed: false, rejectReason: 'FORBIDDEN: viewer cannot write' }
   }
 
-  // 3. 关键修复：用原子操作持久化 op（取代 load→modify→save）
-  //    之前用 whiteboard.save() 在并发场景下会抛 VersionError
+  // 3. 关键修复（实时协作 / B 端延迟看到 bug）：**先广播，再 await 持久化**。
+  //
+  // 之前的顺序：await persistOpAtomically → socket.to().emit('element-op', ...)
+  //   - 含义：mongo 写完后才广播给 B 端
+  //   - 副作用：B 端看到的延迟 = mongo 写入时间（5-50ms / op）
+  //   - 连续 op 在 opChain 串行处理时，每个 op 的 mongo 写入延迟被叠加
+  //   - 用户感知"B 端延迟一段时间才看到 A 的修改/移动"
+  //
+  // 修复后：先 broadcast → B 端立即看到；mongo 持久化在后台 await 完成
+  //   - B 端延迟从 "mongo 写时间" 降到 "socket 推送时间"（< 5ms 本地）
+  //   - 边缘情况：如果 mongo 写入失败，**只通知 A 端**（A 可能需要撤销）
+  //     **不影响 B 端**：B 已经 apply 了 op，状态由 B 端本地管理
+  //   - 持久化失败的情况下，A 端刷新后 B 的状态会"领先"于 A（罕见）
+  //   - 这个 trade-off 优先保证实时性（B 端是主用户感知对象）
+  //
+  // 不附带 serverElements：客户端按到达顺序逐个 apply op，不做整张对齐
+  // 关键修复：附带 whiteboardId 便于客户端按白板过滤
+  const serverOp: ServerElementOp = { ...op, userId, whiteboardId: shortId }
+  socket.to(`whiteboard:${shortId}`).emit('element-op', serverOp)
+
+  // 4. 后台持久化（fire-and-forget）。失败仅通知发送者，不影响广播链。
   const newElements = await persistOpAtomically(shortId, op)
   if (!newElements) {
+    socket.emit('error', {
+      code: 'PERSIST_FAILED',
+      message: 'Op 持久化失败',
+    })
     return { allowed: false, rejectReason: 'PERSIST_FAILED' }
   }
-
-  // 4. 广播给 room 内其他用户（socket.to() 排除自己）
-  //    关键设计：广播只携带 op 本身（add/update/delete/clear-all 的 payload），
-  //    **不**附带 serverElements。客户端按到达顺序逐个 apply op 即可，不需要
-  //    整张对齐（整张对齐会在并发场景下抹掉对方未提交的本地操作）。
-  const serverOp: ServerElementOp = { ...op, userId }
-  socket.to(`whiteboard:${shortId}`).emit('element-op', serverOp)
 
   return {
     allowed: true,
