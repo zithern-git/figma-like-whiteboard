@@ -68,10 +68,19 @@ export default function WhiteboardListPage() {
       const wb = await createWhiteboard(newName.trim())
       setShowCreateModal(false)
       setNewName('')
-      // 关键：用 wb.id (mongo _id) 作 URL 参数。
-      // 之前短暂改成 wb.shortId 会导致画布元素 localStorage（key 用 mongo _id）失效，
-      // 用户看到画布空白。保留 wb.id 让 elements 缓存和 URL 完全对齐。
-      navigate(`/whiteboard/${wb.id}`)
+      // 关键：用 wb.shortId 作 URL 参数（实时协作修复）。
+      // 服务端 socket 广播 op 时附带的 whiteboardId 是 shortId（6 位），
+      // 客户端 useSocketCollab 里的远端 op 过滤器按
+      //   op.whiteboardId !== whiteboardId 丢弃不匹配项。
+      // 如果 URL 用 mongo _id，URL 拿到的 id 永远 != 远端 op 的 shortId，
+      // **所有远端 op 都被丢**，B 必须刷新后通过 join-whiteboard-ack 全量拉才能看到。
+      // 改用 shortId 后 URL id == 服务端广播的 whiteboardId，过滤器全部放行，
+      // 真正的实时协作生效。
+      //
+      // 副作用：localStorage 里按 URL id 命名的缓存（elements / undo / name）
+      // 会以 shortId 为 key 重写，旧 mongo _id key 的缓存失效一次。代价：
+      // 改完后第一次进入旧白板会从服务端拉一次（毫秒级），无功能损失。
+      navigate(`/whiteboard/${wb.shortId}`)
     } catch {
       setError('创建失败，请稍后重试')
     }
@@ -84,8 +93,8 @@ export default function WhiteboardListPage() {
       const wb = await joinWhiteboard(joinCode.trim())
       setShowJoinModal(false)
       setJoinCode('')
-      // 同上：用 mongo _id 让 elements 缓存命中
-      navigate(`/whiteboard/${wb.id}`)
+      // 同上：用 shortId 让 socket 远端 op 过滤器放行
+      navigate(`/whiteboard/${wb.shortId}`)
     } catch {
       setError('加入失败，请检查白板码是否正确')
     }
@@ -170,8 +179,8 @@ export default function WhiteboardListPage() {
             {whiteboards.map((wb) => (
               <div
                 key={wb.id}
-                // 用 wb.id (mongo _id) 作 URL，让 elements / name 缓存 key 与 URL 对齐
-                onClick={() => navigate(`/whiteboard/${wb.id}`)}
+                // 关键：用 wb.shortId 作 URL（实时协作修复），同 handleCreate 的注释。
+                onClick={() => navigate(`/whiteboard/${wb.shortId}`)}
                 className="bg-white rounded-xl border border-gray-200 p-5 cursor-pointer hover:shadow-md hover:border-blue-300 transition-all group"
               >
                 <div className="flex items-start justify-between mb-3">

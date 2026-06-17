@@ -89,7 +89,23 @@ interface CanvasState {
   /** 删除元素 */
   deleteElement: (id: string) => void
   /** 更新元素 */
-  updateElement: (id: string, updates: Partial<CanvasElement>) => void
+  updateElement: (
+    id: string,
+    updates: Partial<CanvasElement>,
+    /**
+     * 关键修复（拖动 / 文本编辑 undo 失效 bug）：可选的"操作前快照"覆盖。
+     *
+     * 背景：拖动期间 useElementTransform 用 _updateElementLive 不停改 store；
+     * 文本编辑期间 TextEditor 用 updateElement 一次次改 text。
+     * 两者在提交最终值时调 updateElement → new UpdateElementCommand(this, id, updates)，
+     * 构造器里 `this.oldSnapshot = deepClone(current)`，但 current 已经是"操作之后"的状态，
+     * 导致 oldSnapshot === newSnapshot，undo 是 no-op（按钮看着亮了但啥也没动）。
+     *
+     * 修复：调用方有"操作前快照"（例如 elementStatesBefore.current 里的初始位置、
+     * 或 originalTextRef.current 里的初始文本）时显式传入，未传则保持旧的"读 current"行为。
+     */
+    oldSnapshotOverride?: CanvasElement
+  ) => void
   /**
    * 关键修复（滑动条拖动卡顿 / 拖动失败）：
    * 拖动期间（例如调透明度、缩放、描边宽度）调用的"轻量更新"路径。
@@ -288,8 +304,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       undoManager.execute(new DeleteElementCommand(self, element))
     },
 
-    updateElement: (id, updates) => {
-      undoManager.execute(new UpdateElementCommand(self, id, updates))
+    updateElement: (id, updates, oldSnapshotOverride) => {
+      undoManager.execute(
+        new UpdateElementCommand(self, id, updates, oldSnapshotOverride)
+      )
     },
 
     /**

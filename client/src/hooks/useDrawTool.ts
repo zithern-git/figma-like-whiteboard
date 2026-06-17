@@ -52,6 +52,12 @@ export function useDrawTool(_renderer: CanvasRenderer | null) {
   const editingContextRef = useRef<EditingContext | null>(null);
 
   // ========== 统一的编辑框清理函数 ==========
+  // 关键修复（文本编辑 undo bug）：保存时如果文本没变（newText === originalText）
+  //   → 跳过 updateElement，避免 no-op undo 记录
+  // 关键修复（取消时 no-op undo bug）：取消时不再调 updateElement(originalText)，
+  //   因为 DOM 编辑期间 store 没被改过（input 只触发 autoResize，不写 store），
+  //   store 里的文本本来就是 originalText。多调一次 updateElement 会产生一条
+  //   "current → originalText" 的 no-op undo 记录，污染用户的 undo 历史。
   const cleanupTextEditor = useCallback(
     (saveChanges: boolean = true) => {
       if (activeInputRef.current) {
@@ -63,26 +69,32 @@ export function useDrawTool(_renderer: CanvasRenderer | null) {
           if (newText || context.element) {
             if (context.element) {
               // 编辑现有文本
-              store.updateElement(context.element.id, { text: newText });
+              // 关键修复：仅当文本真的变了才提交 undo
+              if (newText !== context.originalText) {
+                store.updateElement(context.element.id, { text: newText });
+              }
             } else {
               // 创建新文本
-              const el = store.createElement("text", {
-                x: context.worldX,
-                y: context.worldY,
-                text: newText,
-                width: 200,
-                height: (store.fontSize || 16) * 2,
-                fontSize: store.fontSize || 16,
-              });
-              store.addElement(el);
+              // 关键修复：仅当用户输入了非空文本才创建
+              if (newText.trim()) {
+                const el = store.createElement("text", {
+                  x: context.worldX,
+                  y: context.worldY,
+                  text: newText,
+                  width: 200,
+                  height: (store.fontSize || 16) * 2,
+                  fontSize: store.fontSize || 16,
+                });
+                store.addElement(el);
+              }
             }
           }
-        } else if (!saveChanges && context && context.element) {
-          // 取消编辑：恢复原文本
-          store.updateElement(context.element.id, {
-            text: context.originalText,
-          });
         }
+        // 关键修复：取消分支被删除。
+        // 之前是 `store.updateElement(context.element.id, { text: context.originalText })`，
+        // 但 DOM 编辑期间 store 根本没被改（input 只触发 autoResize），
+        // 现在的 store 文本已经是 originalText，再 update 一次只会产生 no-op undo。
+        // 取消 = 什么都不做，让 store 保持原样。
 
         document.body.removeChild(input);
         activeInputRef.current = null;

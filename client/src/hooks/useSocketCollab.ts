@@ -62,6 +62,26 @@ export function useSocketCollab(
   const pendingClientOpIds = useRef<Set<string>>(new Set())
 
   /**
+   * 关键修复（实时协作失效 bug）：权威 shortId 引用。
+   *
+   * 问题根因：useSocketCollab 的 element-op 过滤器用
+   *   op.whiteboardId !== whiteboardId
+   * 丢弃不匹配项（防"白板串扰"）。whiteboardId 是 URL useParams 拿到的 id。
+   * 服务端广播 op 时 whiteboardId 永远等于 **服务端 normalize 后的 shortId**。
+   *
+   *   - 如果 URL 是 shortId（WhiteboardListPage 跳转用 shortId）→ 过滤器放行 ✓
+   *   - 如果 URL 是 mongo _id（旧链接 / 分享链接 / 直接访问）→ 永远被丢 ✗
+   *     用户表现：A 改动 → 服务端持久化 + 广播给 B → B 收到 → 过滤掉 → B 看不到
+   *               B 刷新 → join-whiteboard-ack 拉服务端最新状态 → 看到改动
+   *
+   * 修复：在 join-whiteboard-ack 到达时把服务端返回的 whiteboardShortId 存到
+   * 这个 ref，过滤器用 actualShortIdRef.current ?? whiteboardId 做判定键。
+   * 这样无论 URL 是 shortId 还是 mongo _id，只要 ack 拿到了真实 shortId，
+   * 过滤器就能正确放行。
+   */
+  const actualShortIdRef = useRef<string | null>(null)
+
+  /**
    * 关键修复：离线操作队列。
    * 断网时 op 不发 socket，而是 push 到 offlineQueue。
    * 重连后按 FIFO 顺序补发。
@@ -252,6 +272,17 @@ export function useSocketCollab(
       }) => {
         // 关键修复 v2：退出"等待 ack"窗口
         isWaitingForAck.current = false
+        // 关键修复（实时协作失效）：记录服务端 normalize 后的权威 shortId
+        // 供下面的 element-op 过滤器使用（详见 actualShortIdRef 注释）。
+        // 防御场景：URL 形如 /whiteboard/<mongo_id>（旧链接 / 分享链接），
+        // whiteboardId 是 24 位 hex，actualShortIdRef 是 6 位 shortId，
+        // 过滤器用 actualShortIdRef 后能正确放行。
+        if (payload.whiteboardShortId) {
+          actualShortIdRef.current = payload.whiteboardShortId
+          console.log(
+            `[useSocketCollab] 记录权威 shortId: ${actualShortIdRef.current}（URL id=${whiteboardId}）`
+          )
+        }
         // 关键修复（白板名"未命名白板"bug）：服务端在 ack 中附带 whiteboardName，
         // 缓存到 localStorage 作为刷新后的兜底（HTTP GET /api/whiteboards/:id
         // 对不在 collaborators 的用户返回 403，会导致 currentWhiteboard 永远 null）。
@@ -364,9 +395,22 @@ export function useSocketCollab(
       // 原因：socket.io 不会自动断开/重连房间；如果 useEffect cleanup 时 socket
       // 没真正断开，或者 join 多个 room 残留，op 可能从其他白板串到当前 store。
       // 通过 op.whiteboardId 与当前 whiteboardId 严格比对来避免。
-      if (!op.whiteboardId || op.whiteboardId !== whiteboardId) {
+      //
+      // 关键修复（实时协作失效 bug）：判定键必须是服务端的 shortId。
+      // 服务端广播的 op.whiteboardId 是 shortId（详见 actualShortIdRef 注释）。
+      // 判定键优先级（多源 fallback，应对各种 server 协议 / URL 形态）：
+      //   1. actualShortIdRef.current    ← 服务端 ack 里的 whiteboardShortId（最权威）
+      //   2. useWhiteboardStore 里 currentWhiteboard.shortId ← HTTP GET 拿到的
+      //   3. whiteboardId                 ← URL useParams（可能是 mongo _id 也可能是 shortId）
+      // 防御：
+      //   - URL 是 shortId（新导航）  → 直接走 3，过滤器放行
+      //   - URL 是 mongo _id（旧链接）→ 走 1 或 2，过滤器放行
+      //   - 全部 fallback 都没拿到（比如服务重启中）→ 用 3 兜底，可能误判但不丢常见 case
+      const storeShortId = useWhiteboardStore.getState().currentWhiteboard?.shortId
+      const filterKey = actualShortIdRef.current ?? storeShortId ?? whiteboardId
+      if (!op.whiteboardId || op.whiteboardId !== filterKey) {
         console.warn(
-          `[useSocketCollab] 忽略来自其他白板的 op: op.wb=${op.whiteboardId}, current=${whiteboardId}`
+          `[useSocketCollab] 忽略来自其他白板的 op: op.wb=${op.whiteboardId}, current=${filterKey}`
         )
         return
       }
@@ -419,6 +463,9 @@ export function useSocketCollab(
       }
       pendingCursorRef.current = null
       pendingClientOpIds.current.clear()
+      // 关键修复（实时协作失效）：清理权威 shortId 引用，防止切到新白板时
+      // 残留旧 shortId 导致新 op 全部被过滤器误判拒绝（见 actualShortIdRef 注释）。
+      actualShortIdRef.current = null
       // 关键修复：清理合并队列，防止下次 mount 时把上次未消费的 op 误合并
       opsToMergeOnAck.current = []
       setOnlineUsers([])

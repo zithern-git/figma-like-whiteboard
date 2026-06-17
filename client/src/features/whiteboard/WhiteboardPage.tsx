@@ -45,9 +45,16 @@ export default function WhiteboardPage() {
   // 修复：用 selector 精确订阅，并在 id 不匹配时把残留数据视为 null。
   //   - currentWhiteboard 只在 id 匹配时返回真值，否则 null（首次 render 不会显示残留名称）
   //   - fetchWhiteboardById 是稳定的 action，用 selector 单独订阅即可
-  const currentWhiteboard = useWhiteboardStore((s) =>
-    s.currentWhiteboard && s.currentWhiteboard.id === id ? s.currentWhiteboard : null
-  )
+  // 关键修复（实时协作修复）：URL 可能是 shortId（WhiteboardListPage 跳转用 shortId）
+  // 也可能是 mongo _id（旧链接/分享）。currentWhiteboard.id 是 mongo _id，
+  // currentWhiteboard.shortId 是 shortId，所以同时匹配两者：
+  //   - 新链接：URL id == shortId → cw.shortId === id 命中
+  //   - 旧链接：URL id == mongo _id → cw.id === id 命中
+  const currentWhiteboard = useWhiteboardStore((s) => {
+    const cw = s.currentWhiteboard
+    if (!cw) return null
+    return cw.id === id || cw.shortId === id ? cw : null
+  })
   const fetchWhiteboardById = useWhiteboardStore((s) => s.fetchWhiteboardById)
 
   const canvasStore = useCanvasStore()
@@ -152,31 +159,29 @@ export default function WhiteboardPage() {
   } = useImageUpload(renderer)
 
   // ========== 实时协作（Phase 6.1） ==========
-  // 关键修复（实时协作失效 bug）：必须传 shortId（不是 URL 里的 mongo _id）。
+  // 关键修复（实时协作失效 bug）：URL 的 id 必须是 shortId（不是 mongo _id）。
   //
-  // URL 形如 /whiteboard/<mongo_id>，所以 useParams 拿到的 id 是 mongo _id。
-  // 但是服务端：
+  // 服务端协议：
   //   - 房间名：whiteboard:<shortId>
   //   - 广播 op 时附带的 whiteboardId：whiteboard.shortId
-  // 而客户端 useSocketCollab 里的 element-op 过滤器按
+  // 客户端 useSocketCollab 里的远端 op 过滤器按
   //   op.whiteboardId !== whiteboardId  丢弃。
-  // 如果 whiteboardId 传的是 mongo _id，永远 != shortId，**所有远端 op 都被丢**。
+  //
+  // 历史 bug：WhiteboardListPage 跳转用 `wb.id` (mongo _id) → useParams 拿到
+  // mongo _id → socket 传 mongo _id 上去 → 服务端虽然内部用 shortId 建房间，
+  // 但广播下来的 op.whiteboardId 是 shortId → 客户端 `shortId !== mongo_id`
+  // 永远成立 → **所有远端 op 都被丢**。
   // 用户表现：A 改动 → 服务端持久化 + 广播给 B → B 收到 → 过滤掉 → B 看不到
   //          B 刷新 → join-whiteboard-ack 拉服务端最新状态 → 看到改动
   //
-  // 修复：使用 currentWhiteboard.shortId（白板数据中明确字段）。
-  // 关键修复（刷新零延迟 / 实时协作）：
-  // 之前：socketWhiteboardId = isLoading ? null : (currentWhiteboard?.shortId ?? id ?? null)
-  //   - isLoading=true 时 socket 不连接，要等 fetchWhiteboardById HTTP GET 几秒
-  //   - fetchWhiteboardById 完成 → setIsLoading(false) → socket 连接 → ack 到达
-  //   - 用户感觉"刷新后几秒才能看到画布"
-  // 现在：直接用 URL 中的 id（shortId，路由 /whiteboard/:id 已经是 shortId）
+  // 修复：WhiteboardListPage 跳转改用 `wb.shortId`（6 位），URL id 就是 shortId。
+  // 这里直接用 `id ?? null` 即可。
   //   - socket 立即连接，ack 立即到达
   //   - fetchWhiteboardById 是为了拿到 currentWhiteboard.name 显示在 Navbar，
   //     **不阻塞画布渲染**和 socket 连接
-  //   - currentWhiteboard?.shortId 和 id 在路由上都是 shortId，等价
-  //   - 如果 id 是 mongo _id（防御性兜底），用 shortId 转换；如果两者不一致，
-  //     socket 远端 op 的 whiteboardId 过滤会失配，但这是后端路由问题，不在客户端处理
+  //   - 如果 id 是 mongo _id（旧链接），过滤仍然失配，**实时协作不生效**。
+  //     防御：上面 currentWhiteboard 选择器已经兼容 id / shortId 两种 URL，
+  //     选型 ok。socket 这边需要依赖 URL 改用 shortId 才能修复。
   const socketWhiteboardId = id ?? null
   const { connectionStatus, onlineUsers } = useSocketCollab(socketWhiteboardId)
 

@@ -3,7 +3,7 @@ import { chromium } from 'playwright';
 const TEST_EMAIL = `test_${Date.now()}@example.com`;
 const TEST_PASSWORD = 'Test123456';
 const TEST_NAME = 'TestUser';
-const BASE_URL = 'http://localhost:5173';
+const BASE_URL = process.env.BASE_URL || 'http://localhost:5173';
 
 async function registerAndLogin(page) {
   await page.goto(`${BASE_URL}/register`);

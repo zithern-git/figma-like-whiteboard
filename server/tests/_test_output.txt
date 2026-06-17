@@ -1,0 +1,44 @@
+﻿--- User A: 注册并登录 ---
+[A][debug] [vite] connecting...
+[A][debug] [vite] connected.
+[A][info] %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold
+[A][log] [useSocketCollab MODULE LOAD] actualShortId fix loaded at 2026-06-17T07:59:47.568Z
+User A URL after login: http://localhost:5174/whiteboards
+Screenshot: e2e_after_login_A.png
+[A][log] [useSocketCollab] socket connected, emit join-whiteboard: whiteboardId=jBTtSk
+[A][log] [useSocketCollab] socket connected, emit join-whiteboard: whiteboardId=jBTtSk
+[A][log] [useSocketCollab ACK] keys: [elements, onlineUsers, version] whiteboardShortId: undefined
+[A][log] [useSocketCollab ACK] keys: [elements, onlineUsers, version] whiteboardShortId: undefined
+Whiteboard URL: http://localhost:5174/whiteboard/jBTtSk
+Screenshot: e2e_whiteboard_A.png
+--- User A: 添加矩形 ---
+Screenshot: e2e_after_add_rect_A.png
+--- User B: 登录同一账号 ---
+[B][debug] [vite] connecting...
+[B][debug] [vite] connected.
+[B][info] %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold
+[B][log] [useSocketCollab MODULE LOAD] actualShortId fix loaded at 2026-06-17T07:59:58.675Z
+--- User B: 进入同一白板 ---
+[B][debug] [vite] connecting...
+[B][debug] [vite] connected.
+[B][info] %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold
+[B][log] [useSocketCollab MODULE LOAD] actualShortId fix loaded at 2026-06-17T08:00:02.001Z
+[B][log] [useSocketCollab] socket connected, emit join-whiteboard: whiteboardId=jBTtSk
+[B][log] [useSocketCollab] socket connected, emit join-whiteboard: whiteboardId=jBTtSk
+[B][log] [useSocketCollab ACK] keys: [elements, onlineUsers, version] whiteboardShortId: undefined
+[B][log] [useSocketCollab ACK] keys: [elements, onlineUsers, version] whiteboardShortId: undefined
+[B][log] [useSocketCollab] 服务端 1 个元素，本地 1 个（无离线 op）→ 用服务端权威状态
+Screenshot: e2e_whiteboard_B.png
+User A element count: 0, positions: []
+User B element count: 0, positions: []
+❌ User A 没有成功添加元素
+❌ 协作测试失败：User B 看不到 User A 添加的元素
+--- User B: 添加第二个矩形 ---
+[A][log] [useSocketCollab] 收到远端 op: type=add userId=6a3253f4924249ad3fe3ee6b clientOpId=_Sy28aD4p2w_ug9wqa1tn
+[A][log] [useSocketCollab] 收到远端 op: type=add userId=6a3253f4924249ad3fe3ee6b clientOpId=_Sy28aD4p2w_ug9wqa1tn
+Screenshot: e2e_after_add_rect_B.png
+Screenshot: e2e_whiteboard_A_after_B.png
+After B adds: A count=0, B count=0
+❌ 双向协作测试失败
+
+⚠️ 部分 E2E 测试失败

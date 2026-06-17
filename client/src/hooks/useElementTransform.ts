@@ -394,6 +394,13 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
    * 不再调 endUndoBatch（之前的设计是"拖动期间每次 updateElement 都入栈，
    * 合并为单次 undo"——但 updateElement 会广播 op，导致 B 端看到回放）。
    * 新设计：拖动期间不入栈，PointerUp 时一次 updateElement 入栈一次 undo。
+   *
+   * 关键修复（拖动 undo 失效 bug）：
+   * 拖动期间 _updateElementLive 已经把 store 改成了 final。
+   * 如果直接把 initial 丢掉让 UpdateElementCommand 自己读 current，
+   * oldSnapshot === newSnapshot，undo 是 no-op。
+   * 因此显式把 initial（拖动前的元素快照）作为 oldSnapshotOverride 传入，
+   * 让 UpdateElementCommand 知道要回到哪。
    */
   const handleTransformEnd = useCallback(
     (_e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -430,11 +437,12 @@ export function useElementTransform(renderer: CanvasRenderer | null) {
               (updates as any)[k] = (finalEl as any)[k];
             }
           }
-          // 关键修复：调一次 updateElement（入栈 + 广播最终值）
-          // UpdateElementCommand 构造时 oldSnapshot=current（已经被 live 改成 final），
-          // newSnapshot=current+updates（=final），但 broadcastFields 强制带上 updates 字段，
-          // 所以 B 端能收到所有变化字段
-          state.updateElement(id, updates);
+          // 关键修复：把 initial 作为 oldSnapshotOverride 传入，
+          // 让 UpdateElementCommand 的 oldSnapshot 真正指向"操作前状态"。
+          // 拖动期间 _updateElementLive 已经把 store 改成了 final，
+          // 不传 oldSnapshotOverride 会导致 oldSnapshot === newSnapshot，
+          // undo 是 no-op。
+          state.updateElement(id, updates, initial);
         }
       }
       isTransforming.current = false;

@@ -220,7 +220,20 @@ export class UpdateElementCommand implements Command {
   constructor(
     private readonly store: CommandStore,
     id: string,
-    updates: Partial<CanvasElement>
+    updates: Partial<CanvasElement>,
+    /**
+     * 关键修复（拖动 / 文本编辑 undo 失效 bug）：可选的"操作前快照"覆盖。
+     *
+     * 背景：拖动期间 useElementTransform 用 _updateElementLive 不停改 store；
+     * 文本编辑期间 TextEditor 用 updateElement 一次次改 text。
+     * 两者在提交最终值时调 updateElement → new UpdateElementCommand(this, id, updates)，
+     * 构造器里 `this.oldSnapshot = deepClone(current)`，但 current 已经是"操作之后"的状态，
+     * 导致 oldSnapshot === newSnapshot，undo 是 no-op（按钮看着亮了但啥也没动）。
+     *
+     * 修复：调用方有"操作前快照"（例如 elementStatesBefore.current 里的初始位置、
+     * 或 originalTextRef.current 里的初始文本）时显式传入，未传则保持旧的"读 current"行为。
+     */
+    oldSnapshotOverride?: CanvasElement
   ) {
     this.broadcastFields = new Set(Object.keys(updates))
     const current = this.store._getElementRaw(id)
@@ -230,7 +243,7 @@ export class UpdateElementCommand implements Command {
       this.newSnapshot = { id, type: 'rect' } as CanvasElement
       return
     }
-    this.oldSnapshot = deepClone(current)
+    this.oldSnapshot = deepClone(oldSnapshotOverride ?? current)
     this.newSnapshot = deepClone({ ...current, ...updates, updatedAt: Date.now() })
   }
 
