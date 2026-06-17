@@ -85,44 +85,53 @@ export function useImageUpload(renderer: CanvasRenderer | null) {
         h = Math.round(h * scale)
       }
 
-      // 第 2 步：决定上传数据
-      let imageUrl = dataUrl
-      let uploaded = false
-
-      if (file.size > COMPRESS_THRESHOLD_BYTES) {
-        // 大文件：先压缩再上传
-        try {
-          const compressed = await compressImage(dataUrl, w, h)
-          imageUrl = await uploadToServer(compressed, file.name)
-          uploaded = true
-          toast.success(`已添加图片（${(file.size / 1024 / 1024).toFixed(1)}MB，已自动压缩）`)
-        } catch (err) {
-          console.error("[useImageUpload] 压缩/上传失败，降级到 base64:", err)
-          // 降级：直接用 dataURL
-        }
-      } else {
-        // 小文件：直接上传
-        try {
-          imageUrl = await uploadToServer(dataUrl, file.name)
-          uploaded = true
-        } catch (err) {
-          console.warn("[useImageUpload] 上传失败，降级到 base64:", err)
-          // 降级：使用 dataURL
-        }
-      }
-
-      // 第 3 步：创建 image 元素
-      addImageElement(state, imageUrl, w, h, worldPos, renderer)
-      if (!uploaded) {
-        toast.info("已添加图片（离线模式，未上传至服务器）")
-      }
+      // 关键修复（A/B 端图片延迟看到 bug）：
+      // 之前：上传成功后才 addImageElement（HTTPS URL）
+      //   - A 端 add 后 CanvasRenderer.loadImage(HTTP URL) → HTTP GET（首次访问几 MB 要几秒）
+      //   - add op 携带 HTTP URL → B 端 add 后 loadImage(HTTP URL) → HTTP GET（同样要几秒）
+      //   - 用户感知"A 上传完图片 A/B 都要等几秒才看到"
+      // 修复：addImageElement 时**先用 base64 dataUrl**（浏览器内嵌，无 HTTP）
+      //   - A 端：new Image().src = dataUrl 立即 ready（无网络），A 端 0 延迟看到
+      //   - B 端：add op 携带 dataUrl（虽然 add op 几 MB，但 socket 推送几 MB 仍比 HTTP 下载几 MB 快）
+      //           B 端 new Image().src = dataUrl 立即 ready，B 端 0 延迟看到
+      //   - 上传完成后调 updateElement(id, { imageUrl: HTTP_URL })：
+      //       - A 端自己从 dataUrl 切到 HTTP URL（持久化）
+      //       - B 端 update op 改 imageUrl，从 dataUrl 切到 HTTP URL（持久化）
+      //       - update op 只携带 imageUrl 字段（几 KB），socket 推送快
+      //   - 极端情况：add op 推送中服务端挂掉 / 网络断 → add op 丢失但图片已 add
+      //     此时 B 端刷新后用 HTTP URL（因为 update op 在 mongo 持久化后才有 imageUrl）
+      //     → B 端从服务端 mongo 拉到 HTTP URL element → 走 HTTP GET（首次访问延迟）
+      //     这是极少数边界情况，优先保证实时性
+      const imageEl = addImageElement(state, dataUrl, w, h, worldPos, renderer)
+      const elementId = imageEl.id
 
       // 关键修复：图片添加完成后切回 select 工具
-      // 之前由 WhiteboardPage 的 useEffect 在 activeTool === 'image' 时切回，
-      // 但该 useEffect 同时调用 openFilePicker()，导致与 Toolbar 里的调用重复，
-      // 第二次 click() 被浏览器排队，在用户关闭第一次对话框后再次弹出。
-      // 改在文件处理完成时切回：单点触发、无副作用、时序确定。
       useCanvasStore.getState().setTool("select")
+
+      // 第 2 步：异步上传到服务端 + 拿到 HTTP URL 后改 imageUrl
+      // 走 async IIFE 不阻塞 addImageElement（add op 立即广播给 B）
+      ;(async () => {
+        try {
+          let httpUrl: string
+          if (file.size > COMPRESS_THRESHOLD_BYTES) {
+            const compressed = await compressImage(dataUrl, w, h)
+            httpUrl = await uploadToServer(compressed, file.name)
+            toast.success(
+              `已添加图片（${(file.size / 1024 / 1024).toFixed(1)}MB，已自动压缩）`
+            )
+          } else {
+            httpUrl = await uploadToServer(dataUrl, file.name)
+          }
+          // 关键修复：上传完成后改 imageUrl 为 HTTP URL（持久化）
+          // 走 updateElement → UpdateElementCommand.execute → 广播 update op
+          // B 端 update op 改 imageUrl 为 HTTP URL，dataUrl 内存释放
+          useCanvasStore.getState().updateElement(elementId, { imageUrl: httpUrl })
+        } catch (err) {
+          // 上传失败：保持 dataUrl（已经是降级路径）
+          console.warn("[useImageUpload] 上传失败，保持 dataUrl:", err)
+          toast.info("已添加图片（离线模式，未上传至服务器）")
+        }
+      })()
     },
     [renderer]
   );
@@ -343,6 +352,13 @@ async function uploadToServer(dataUrl: string, filename: string): Promise<string
  *
  * 关键修复：保留宽高比 - 调用方传入的 w/h 已经是等比缩放后的尺寸，
  * 创建 image 元素时直接使用，保证 Shift 锁比例拖拽时的初始比例正确。
+ *
+ * 关键修复（A/B 端图片延迟看到 bug）：
+ * 接受**任意 imageUrl**（dataUrl 或 HTTP URL）。
+ * - A 端调用时传 dataUrl（base64），add op 携带 dataUrl，B 端 add op 立即 inline 显示（无 HTTP）
+ * - 后续 A 端 uploadToServer 拿到 HTTP URL 后调 updateElement 改 imageUrl
+ *
+ * @returns 创建的 image 元素（用于 upload 后调 updateElement 改 imageUrl）
  */
 function addImageElement(
   state: ReturnType<typeof useCanvasStore.getState>,
@@ -351,7 +367,7 @@ function addImageElement(
   h: number,
   worldPos: { x: number; y: number } | undefined,
   renderer: CanvasRenderer | null
-) {
+): CanvasElement {
   // 计算放置位置：优先用传入的 worldPos，其次用视口中心
   let posX = 0
   let posY = 0
@@ -375,18 +391,11 @@ function addImageElement(
     height: h,
     imageUrl,
   })
-  // 关键修复（A 端上传后立即看到图，无占位符闪烁）：
-  // A 端 imageUrl 可能是服务端返回的 URL（首次访问需要 HTTP GET）
-  // 也可能是 base64 dataURL（降级路径，浏览器立即可读）。
-  // 对 HTTP URL 场景，立即 preloadImages 触发 HTTP 缓存预热，
-  // 让 CanvasRenderer.loadImage 后续创建 new Image() 时命中缓存，毫秒级 ready。
-  if (imageUrl.startsWith("http") || imageUrl.startsWith("/")) {
-    // 关键修复：动态 import 避免循环依赖（elementsStorage 不依赖 useImageUpload）
-    void import("@/canvas/elementsStorage").then(({ preloadImages }) => {
-      preloadImages([imageEl])
-    })
-  }
+  // 关键修复：图片预热（A 端首次添加的优化）
+  // 之前 addImageElement 之后 A 端 CanvasRenderer.loadImage 触发 HTTP GET（几秒延迟）
+  // 现在 addImageElement 时 imageUrl 是 dataUrl（base64），浏览器立即 inline 显示，无需预热
   state.addElement(imageEl)
   // 创建后自动选中新图片，方便用户立即拖动或调整
   state.setSelectedIds(new Set([imageEl.id]))
+  return imageEl
 }

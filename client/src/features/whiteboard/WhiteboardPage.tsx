@@ -7,7 +7,7 @@
  * Phase 8：拆分为 components/layout/* 三个组件，页面只做编排
  */
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useLayoutEffect, useState, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import Canvas from '@/components/canvas/Canvas'
 import { CanvasRenderer, HitArea } from '@/canvas'
@@ -27,7 +27,7 @@ import Toolbar from '@/components/layout/Toolbar'
 import PropertiesPanel from '@/components/layout/PropertiesPanel'
 import { exportAndDownload } from '@/utils/exportCanvas'
 import { toast } from '@/stores/toastStore'
-import { loadElements, saveElements, flushPendingElementsWrites, preloadImages, loadUndoStack, loadRedoStack, saveUndoStack } from '@/canvas/elementsStorage'
+import { loadElements, saveElements, flushPendingElementsWrites, preloadImages, loadUndoStack, loadRedoStack, saveUndoStack, loadWhiteboardName } from '@/canvas/elementsStorage'
 
 /** 属性面板折叠状态 key（按用户 ID 隔离） */
 const PANEL_COLLAPSED_KEY_PREFIX = 'wb:panel:collapsed:'
@@ -36,12 +36,52 @@ export default function WhiteboardPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const user = useAuthStore((s) => s.user)
-  const { currentWhiteboard, fetchWhiteboardById } = useWhiteboardStore()
+  // 关键修复（白板切换名称残留 bug）：
+  // 之前 const { currentWhiteboard, fetchWhiteboardById } = useWhiteboardStore()，
+  // 整个 store 订阅任何字段变化都触发 re-render，且 currentWhiteboard 可能是上一个白板的
+  // 残留数据（id 不匹配当前 URL），导致：
+  //   1) 从 second 画板退出后进入 first 画板，Navbar 一瞬间显示 "second" → "first"
+  //   2) 频繁的 isLoading 切换触发不必要 re-render
+  // 修复：用 selector 精确订阅，并在 id 不匹配时把残留数据视为 null。
+  //   - currentWhiteboard 只在 id 匹配时返回真值，否则 null（首次 render 不会显示残留名称）
+  //   - fetchWhiteboardById 是稳定的 action，用 selector 单独订阅即可
+  const currentWhiteboard = useWhiteboardStore((s) =>
+    s.currentWhiteboard && s.currentWhiteboard.id === id ? s.currentWhiteboard : null
+  )
+  const fetchWhiteboardById = useWhiteboardStore((s) => s.fetchWhiteboardById)
 
   const canvasStore = useCanvasStore()
   const [renderer, setRenderer] = useState<CanvasRenderer | null>(null)
   const [zoom, setZoom] = useState(1)
   const [isLoading, setIsLoading] = useState(true)
+
+  // 关键修复（白板名"未命名白板"bug）：在第一次 render 之前同步从 localStorage
+  // 读取白板名缓存。useState lazy init 只在 mount 时跑一次，渲染前完成。
+  // 兜底逻辑（Navbar 名称）：
+  //   - currentWhiteboard?.name 优先（HTTP GET 成功时）
+  //   - 否则 cachedWhiteboardName（socket ack 缓存到 localStorage 的）
+  //   - 否则 shortId（前 6 位）/ '未命名白板' 兜底
+  const [cachedWhiteboardName, setCachedWhiteboardName] = useState<string | null>(
+    () => (id ? loadWhiteboardName(id) : null)
+  )
+  // 关键修复：socket ack 到达时会更新 localStorage 缓存，但 cachedWhiteboardName
+  // 是 useState 不会自动感知 localStorage 变化。让 useSocketCollab 通过 window 事件
+  // 通知 WhiteboardPage 更新，或者直接在 socket ack 中回调 setCachedWhiteboardName。
+  // 这里用更简单的方案：每次 id 变化时重新从 localStorage 读（已经在 useState lazy init 跑过）
+  // socket ack 到达时通过自定义事件通知
+  useEffect(() => {
+    // 关键修复（白板名"未命名白板"bug）：用 url 的 id 匹配而不是 shortId。
+    // 之前 ce.detail.shortId === id 永远 false（URL 是 mongo _id，shortId 是 6 位）。
+    // 现在 socket ack 改用 whiteboardId 作 detail 字段，等于 URL 里的 id，能稳定匹配。
+    const onNameUpdate = (e: Event) => {
+      const ce = e as CustomEvent<{ whiteboardId: string; name: string }>
+      if (ce.detail?.whiteboardId === id) {
+        setCachedWhiteboardName(ce.detail.name)
+      }
+    }
+    window.addEventListener('whiteboard-name-updated', onNameUpdate)
+    return () => window.removeEventListener('whiteboard-name-updated', onNameUpdate)
+  }, [id])
 
   // 属性面板折叠态（按用户 ID 持久化）
   const [panelExpanded, setPanelExpanded] = useState<boolean>(() => {
@@ -125,26 +165,47 @@ export default function WhiteboardPage() {
   //          B 刷新 → join-whiteboard-ack 拉服务端最新状态 → 看到改动
   //
   // 修复：使用 currentWhiteboard.shortId（白板数据中明确字段）。
-  // - currentWhiteboard 已加载：用 shortId ✓
-  // - 还在加载中（isLoading=true）：传 null，不连 socket（避免用错的 id 连上）
-  // - 加载失败：fallback 到 id（极端情况，filter 会失配，但用户也用不了白板）
-  const socketWhiteboardId = isLoading
-    ? null
-    : (currentWhiteboard?.shortId ?? id ?? null)
+  // 关键修复（刷新零延迟 / 实时协作）：
+  // 之前：socketWhiteboardId = isLoading ? null : (currentWhiteboard?.shortId ?? id ?? null)
+  //   - isLoading=true 时 socket 不连接，要等 fetchWhiteboardById HTTP GET 几秒
+  //   - fetchWhiteboardById 完成 → setIsLoading(false) → socket 连接 → ack 到达
+  //   - 用户感觉"刷新后几秒才能看到画布"
+  // 现在：直接用 URL 中的 id（shortId，路由 /whiteboard/:id 已经是 shortId）
+  //   - socket 立即连接，ack 立即到达
+  //   - fetchWhiteboardById 是为了拿到 currentWhiteboard.name 显示在 Navbar，
+  //     **不阻塞画布渲染**和 socket 连接
+  //   - currentWhiteboard?.shortId 和 id 在路由上都是 shortId，等价
+  //   - 如果 id 是 mongo _id（防御性兜底），用 shortId 转换；如果两者不一致，
+  //     socket 远端 op 的 whiteboardId 过滤会失配，但这是后端路由问题，不在客户端处理
+  const socketWhiteboardId = id ?? null
   const { connectionStatus, onlineUsers } = useSocketCollab(socketWhiteboardId)
 
-  // 关键修复（刷新立刻恢复）：从 localStorage 立即恢复 elements，
-  // 不等待 socket 连接 / join-whiteboard-ack / fetchWhiteboardById。
-  // 这个 useEffect 必须在 isLoading 守卫之前定义，且不能被 isLoading 卡住。
-  // - 时机：组件 mount 之后立即执行（一次性）
-  // - 与 socket 的协作：ack 到达后用服务端状态 setElements 全量替换
-  //   （服务端是权威源，离线期间的 op 已通过 queue 合并到 ack payload）
-  useEffect(() => {
+  // 关键修复（刷新立刻恢复 + 白板切换不串扰 + **消除 1-2 帧白屏**）：
+  // 之前两个独立 useEffect 依赖 [id]，按代码顺序执行：
+  //   1) useEffect A (line 142 旧版) 从 localStorage 恢复 → store 有 cached
+  //   2) useEffect B (line 177 旧版) 清空 store → **cached 被清掉！**
+  //   3) Canvas 渲染空白
+  //   4) 等 socket connect + join + mongo query + ack → 几秒后才看到画布
+  //
+  // 修复 v2：用 useLayoutEffect 代替 useEffect，让 cached 在**浏览器 paint 之前**
+  // 就设置到 zustand store。第一次 render（commit 阶段）后、浏览器 paint 前：
+  //   1) 清空内存（白板切换时清掉 A 残留）
+  //   2) 同步从 localStorage 恢复 cached
+  //   3) 订阅 store 变化自动写 localStorage
+  // 这样浏览器首次 paint 时，store 已经有 cached，Canvas 立即渲染 cached。
+  // **消除了 1-2 帧（16-32ms）的"store 空 → render 空白"白屏**。
+  useLayoutEffect(() => {
     if (!id) return
+    // 第 1 步：清空内存（白板切换时清掉 A 残留；首次 mount 时清掉上一白板残留）
+    useCanvasStore.setState({ elements: [] })
+    useCanvasStore.getState().clearSelection()
+    // 关键修复：清空 undo/redo 栈，避免跨白板栈引用旧元素
+    // 走 canvasStore.clearUndoStack() 让 UndoManager 同步空栈到 React state
+    useCanvasStore.getState().clearUndoStack()
+
+    // 第 2 步：立即从 localStorage 恢复 cached（关键修复：刷新零延迟）
     const cached = loadElements(id)
     if (cached.length > 0) {
-      // 关键修复（刷新后保留 undo 栈）：setElements 传 false 不清空 undo 栈。
-      // 然后立即用 loadUndoStack / loadRedoStack 恢复栈（不执行命令，只恢复栈内容）。
       useCanvasStore.getState().setElements(cached, false)
       const undoData = loadUndoStack(id)
       const redoData = loadRedoStack(id)
@@ -154,54 +215,33 @@ export default function WhiteboardPage() {
         )
         useCanvasStore.getState().restoreUndoStack(undoData, redoData)
       }
-      // 关键修复（图片闪一下）：立即预热图片元素的 HTTP 缓存。
-      // 刷新后 CanvasRenderer 会创建 new Image() + img.src = url，
-      // 如果 HTTP 缓存没命中，需要 DNS + TCP + HTTP 请求 + 图片解码，
-      // 几十~几百 ms 期间只能显示"加载中..."占位符。
-      // 预热后图片走缓存，毫秒级完成，几乎无感知。
       preloadImages(cached)
     }
-  }, [id])
 
-  // 关键修复（刷新立刻恢复 + 保留 undo 栈）：订阅 elements / undoStack / redoStack 变化，
-  // 自动写入 localStorage。这样下次刷新就能立即看到画布内容 + 撤销/重做栈。
-  //
-  // 关键修复（白板串扰 bug）：白板切换时（id 变化）需要清空 canvasStore 避免残留。
-  // 但**绝对不能**调用 saveElements(id, [])，否则会覆盖当前白板的 localStorage 缓存，
-  // 导致刷新后空白画布。
-  //
-  // 正确做法：
-  // - 清空 canvasStore 内存（不写入 localStorage）
-  // - 订阅只监听**当前 id** 对应的 store 变化
-  // - 切换白板时先取消旧订阅，再建立新订阅
-  useEffect(() => {
-    if (!id) return
-    // 关键修复：只清空内存中的 canvasStore，**不**写入 localStorage。
-    // 原因：setElements([], true) 会触发 subscribe → saveElements(id, [])，
-    // 把当前白板的 localStorage 缓存覆盖为空数组。用户刷新后 loadElements(id)
-    // 只能读到 [] → 空白画布。
-    useCanvasStore.setState({ elements: [] })
-    useCanvasStore.getState().clearSelection()
-
+    // 第 3 步：订阅 store 变化，自动写 localStorage
     let prevElements = useCanvasStore.getState().elements
     let prevUndo = useCanvasStore.getState().undoStack
     let prevRedo = useCanvasStore.getState().redoStack
+    saveElements(id, prevElements)
+    saveUndoStack(
+      id,
+      useCanvasStore.getState().serializeUndoStack(),
+      useCanvasStore.getState().serializeRedoStack()
+    )
     const unsub = useCanvasStore.subscribe((s) => {
-      let changed = false
       if (s.elements !== prevElements) {
         prevElements = s.elements
         saveElements(id, s.elements)
-        changed = true
       }
       if (s.undoStack !== prevUndo || s.redoStack !== prevRedo) {
         prevUndo = s.undoStack
         prevRedo = s.redoStack
-        // 关键修复（刷新后保留 undo 栈）：栈变化时也持久化。
-        // 注意：undo/redo 操作每按一次都会改栈（~10-20Hz 频率），写栈比写 elements 轻量。
-        saveUndoStack(id, useCanvasStore.getState().serializeUndoStack(), useCanvasStore.getState().serializeRedoStack())
-        changed = true
+        saveUndoStack(
+          id,
+          useCanvasStore.getState().serializeUndoStack(),
+          useCanvasStore.getState().serializeRedoStack()
+        )
       }
-      void changed
     })
     return unsub
   }, [id])
@@ -228,9 +268,21 @@ export default function WhiteboardPage() {
     return () => window.removeEventListener('paste', onPaste)
   }, [onPaste])
 
-  // 加载白板数据
+  // 关键修复（白板切换 / 名称残留 bug）：
+  // 路由变化 (A → B) 时 React Router 复用 WhiteboardPage 不重新 mount：
+  //   - currentWhiteboard 仍是 A 的数据 → Navbar 显示 "A" 的名称
+  //   - cachedWhiteboardName useState lazy init 只在 mount 跑一次
+  //   - fetchWhiteboardById(B) 几百 ms 后才返回 B 的数据
+  //   - 中间阶段 Navbar 一直显示 "A" 的名称（残留 bug）
+  //
+  // 修复：id 变化时
+  //   1) 立即清空 currentWhiteboard（Navbar 退到 cachedWhiteboardName 兜底）
+  //   2) 同步重读 cachedWhiteboardName（用新 id 查 localStorage）
+  //   3) 然后 fetchWhiteboardById（异步 HTTP GET，几百 ms 后用 currentWhiteboard.name 覆盖）
   useEffect(() => {
     if (!id) return
+    useWhiteboardStore.setState({ currentWhiteboard: null })
+    setCachedWhiteboardName(loadWhiteboardName(id))
     fetchWhiteboardById(id).finally(() => setIsLoading(false))
   }, [id, fetchWhiteboardById])
 
@@ -492,7 +544,14 @@ export default function WhiteboardPage() {
     <div className="h-screen flex flex-col bg-[#FAFAFA] overflow-hidden">
       {/* 顶部导航栏 */}
       <Navbar
-        whiteboardName={currentWhiteboard?.name || '未命名白板'}
+        // 关键修复（白板名"未命名白板"bug）：
+        // 优先 currentWhiteboard?.name（HTTP GET /api/whiteboards/:id 成功时），
+        // 否则 cachedWhiteboardName（socket ack 缓存到 localStorage 的），
+        // 最后才 "未命名白板"。
+        // 之前有 shortId 兜底（6a2a6c55…），用户反馈短 ID 不好看，已移除。
+        whiteboardName={
+          currentWhiteboard?.name || cachedWhiteboardName || '未命名白板'
+        }
         onBack={handleBack}
         zoom={zoom}
         onZoomOut={handleZoomOut}

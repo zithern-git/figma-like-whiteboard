@@ -22,6 +22,7 @@ import { useCanvasStore, ClientOp, ServerOp } from '@/stores/canvasStore'
 import { CanvasElement } from '@/canvas/CanvasElement'
 import { useAuthStore } from '@/stores/authStore'
 import { toast } from '@/stores/toastStore'
+import { saveWhiteboardName } from '@/canvas/elementsStorage'
 
 /** 在线用户展示信息（与服务端协议对齐） */
 export interface OnlineUser {
@@ -242,9 +243,47 @@ export function useSocketCollab(
     // ========== 白板事件 ==========
     socket.on(
       'join-whiteboard-ack',
-      (payload: { elements: CanvasElement[]; onlineUsers: OnlineUser[]; version: number }) => {
+      (payload: {
+        elements: CanvasElement[]
+        onlineUsers: OnlineUser[]
+        whiteboardName?: string
+        whiteboardShortId?: string
+        version: number
+      }) => {
         // 关键修复 v2：退出"等待 ack"窗口
         isWaitingForAck.current = false
+        // 关键修复（白板名"未命名白板"bug）：服务端在 ack 中附带 whiteboardName，
+        // 缓存到 localStorage 作为刷新后的兜底（HTTP GET /api/whiteboards/:id
+        // 对不在 collaborators 的用户返回 403，会导致 currentWhiteboard 永远 null）。
+        if (payload.whiteboardName) {
+          // 关键修复：缓存 key 用当前 whiteboardId（即 URL 里的 id），
+          // 而**不是** server 返回的 whiteboardShortId。
+          // 原因：URL 形如 /whiteboard/<mongo_id> 时 useParams 拿到的是 24 位
+          // hex mongo _id，WhiteboardPage 里的 loadWhiteboardName(id) 用
+          // 这个 id 查 localStorage。如果这里存 shortId，6 位和 24 位永远
+          // 对不上，刷新后缓存 miss → Navbar 退到 "未命名白板"。
+          // 用 whiteboardId 存（无论 mongo _id 还是 shortId）都能命中。
+          // 同时把对方的 shortId 也存一份，防御别人用 /whiteboard/<shortId>
+          // 访问时也能命中。
+          saveWhiteboardName(whiteboardId, payload.whiteboardName)
+          if (
+            payload.whiteboardShortId &&
+            payload.whiteboardShortId !== whiteboardId
+          ) {
+            saveWhiteboardName(payload.whiteboardShortId, payload.whiteboardName)
+          }
+          // 关键修复：通知 WhiteboardPage 更新 cachedWhiteboardName 状态，
+          // 让 Navbar 立即显示真实名称（不等 React 重新读取 localStorage）。
+          // 用 whiteboardId 作匹配键，跟 WhiteboardPage 的 id (useParams) 一致。
+          window.dispatchEvent(
+            new CustomEvent('whiteboard-name-updated', {
+              detail: {
+                whiteboardId,
+                name: payload.whiteboardName,
+              },
+            })
+          )
+        }
         // 关键修复（白板串扰 bug）：先做白板 ID 校验
         // 服务端已经在 join-whiteboard 时校验过 shortId 是否匹配，但 ack 的 elements
         // 是服务端根据 shortId 查的。如果 whiteboardId 传错，服务端会返回错误白板的 elements。

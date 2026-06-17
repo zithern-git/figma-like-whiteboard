@@ -118,6 +118,13 @@ interface CanvasState {
    */
   setElements: (elements: CanvasElement[], clearUndoStack?: boolean) => void
   /**
+   * 关键修复（白板切换 / 跨白板撤销栈污染）：清空 undo/redo 栈。
+   * 用于 WhiteboardPage 在白板切换时清理栈，避免栈内 Command 引用旧白板元素
+   * （被 undo 时会把旧元素插入新白板）。
+   * 内部走 UndoManager.clear()，通过 onChange 同步空栈到 React state。
+   */
+  clearUndoStack: () => void
+  /**
    * 关键修复（刷新后保留 undo 栈）：用序列化数据恢复 undo/redo 栈。
    * 用于刷新后从 localStorage 加载栈，立即生效。
    */
@@ -323,6 +330,16 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         undoManager.clear()
       }
       set({ elements })
+    },
+
+    /**
+     * 关键修复（白板切换 / 跨白板撤销栈污染）：清空 undo/redo 栈。
+     * 走 UndoManager.clear()，让 onChange 自然同步空栈到 React state。
+     * 不绕开 UndoManager：直接 setState({undoStack: [], redoStack: []})
+     * 会被 UndoManager 下一次 onChange 用内部数组覆盖回去。
+     */
+    clearUndoStack: () => {
+      undoManager.clear()
     },
 
     /**

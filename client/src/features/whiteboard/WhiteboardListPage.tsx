@@ -9,11 +9,11 @@ export default function WhiteboardListPage() {
   const logout = useAuthStore((s) => s.logout)
   const {
     whiteboards,
-    isLoading,
     fetchWhiteboards,
     createWhiteboard,
     deleteWhiteboard,
     joinWhiteboard,
+    setCurrentUserId,
   } = useWhiteboardStore()
 
   const [showCreateModal, setShowCreateModal] = useState(false)
@@ -23,10 +23,6 @@ export default function WhiteboardListPage() {
   const [error, setError] = useState('')
   /** 记录刚刚复制了哪个白板码，用于显示"已复制"反馈 */
   const [copiedId, setCopiedId] = useState<string | null>(null)
-
-  const loadWhiteboards = useCallback(() => {
-    fetchWhiteboards()
-  }, [fetchWhiteboards])
 
   /**
    * 复制白板码到剪贴板。复制成功时短暂显示"已复制"反馈（1.5s 后清除）。
@@ -55,8 +51,15 @@ export default function WhiteboardListPage() {
   )
 
   useEffect(() => {
-    loadWhiteboards()
-  }, [loadWhiteboards])
+    // 关键修复（白板列表刷新闪烁）：
+    // 1) setCurrentUserId 同步把 localStorage 缓存里该 userId 的旧列表填进 store，
+    //    首帧立刻渲染 grid，不再显示"还没有白板..."。
+    // 2) fetchWhiteboards 后台 HTTP 拉最新数据，回调里覆盖缓存。
+    // 3) 依赖 user?.id：换账号登录时立刻切到新用户的缓存。
+    if (!user?.id) return
+    setCurrentUserId(user.id)
+    fetchWhiteboards()
+  }, [user?.id, setCurrentUserId, fetchWhiteboards])
 
   const handleCreate = async () => {
     if (!newName.trim()) return
@@ -65,6 +68,9 @@ export default function WhiteboardListPage() {
       const wb = await createWhiteboard(newName.trim())
       setShowCreateModal(false)
       setNewName('')
+      // 关键：用 wb.id (mongo _id) 作 URL 参数。
+      // 之前短暂改成 wb.shortId 会导致画布元素 localStorage（key 用 mongo _id）失效，
+      // 用户看到画布空白。保留 wb.id 让 elements 缓存和 URL 完全对齐。
       navigate(`/whiteboard/${wb.id}`)
     } catch {
       setError('创建失败，请稍后重试')
@@ -78,6 +84,7 @@ export default function WhiteboardListPage() {
       const wb = await joinWhiteboard(joinCode.trim())
       setShowJoinModal(false)
       setJoinCode('')
+      // 同上：用 mongo _id 让 elements 缓存命中
       navigate(`/whiteboard/${wb.id}`)
     } catch {
       setError('加入失败，请检查白板码是否正确')
@@ -148,9 +155,7 @@ export default function WhiteboardListPage() {
           </div>
         )}
 
-        {isLoading ? (
-          <div className="text-center py-12 text-gray-500">加载中...</div>
-        ) : whiteboards.length === 0 ? (
+        {whiteboards.length === 0 ? (
           <div className="text-center py-12">
             <p className="text-gray-500 mb-4">还没有白板，创建一个开始协作吧</p>
             <button
@@ -165,6 +170,7 @@ export default function WhiteboardListPage() {
             {whiteboards.map((wb) => (
               <div
                 key={wb.id}
+                // 用 wb.id (mongo _id) 作 URL，让 elements / name 缓存 key 与 URL 对齐
                 onClick={() => navigate(`/whiteboard/${wb.id}`)}
                 className="bg-white rounded-xl border border-gray-200 p-5 cursor-pointer hover:shadow-md hover:border-blue-300 transition-all group"
               >

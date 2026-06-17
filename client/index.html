@@ -4,10 +4,60 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vite + React + TS</title>
+    <title>协作白板</title>
+    <!-- 关键修复（消除白屏）：JS 加载期间显示 loading 占位符，避免 body 空白 -->
+    <style>
+      html, body, #root { height: 100%; margin: 0; }
+      body {
+        background: #FAFAFA;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        color: #333;
+      }
+      /* 关键修复：JS 加载前显示 loading 占位符；
+         React 首次 render（commit）完成后会被真实组件覆盖（display: none 也行）。
+         这里用 #root 子元素策略：loading 是 #root 的兄弟节点。
+         但 root 是 #root 单元素，所以 loading 放在 #root 内、由 React mount 时替换。
+         简单方案：loading 是 #root 的"占位内容"，React 首次 render 用 replaceAll 风格覆盖。
+         React 18 createRoot.render() 会保留 #root 子节点直到 mount 完成后才替换。
+         因此这里放静态 HTML，React mount 后会替换。 */
+      .app-loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        z-index: 9999;
+        pointer-events: none;
+      }
+      .app-loading-spinner {
+        width: 36px;
+        height: 36px;
+        border: 3px solid #E5E5E5;
+        border-top-color: #0D99FF;
+        border-radius: 50%;
+        animation: app-loading-spin 0.8s linear infinite;
+      }
+      @keyframes app-loading-spin {
+        to { transform: rotate(360deg); }
+      }
+      .app-loading-text {
+        font-size: 13px;
+        color: #9E9E9E;
+        letter-spacing: 0.5px;
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- 关键修复（消除白屏）：JS 加载期间显示 loading 占位符。
+           React 18 createRoot 首次 render 时会清空 #root 并渲染真实组件。 -->
+      <div class="app-loading" id="app-loading-fallback">
+        <div class="app-loading-spinner"></div>
+        <div class="app-loading-text">正在加载...</div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

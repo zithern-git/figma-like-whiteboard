@@ -25,8 +25,36 @@
 import type { CanvasElement } from './CanvasElement'
 
 const STORAGE_KEY_PREFIX = 'whiteboard.elements.'
+const STORAGE_NAME_KEY_PREFIX = 'whiteboard.name.'
 const writeQueue = new Map<string, number>()  // whiteboardId -> rAF id
 const pendingWrites = new Map<string, CanvasElement[]>()  // whiteboardId -> latest elements
+
+/**
+ * 关键修复（白板名"未命名白板"bug）：从 localStorage 读取白板名缓存。
+ *
+ * 背景：HTTP GET /api/whiteboards/:id 需要 requireRole（owner/editor/viewer），
+ * 不在 collaborators 列表的用户返回 403 → currentWhiteboard 永远 null → Navbar 退到兜底。
+ * 解决：socket join-whiteboard-ack 携带 whiteboardName，缓存到 localStorage，
+ * 刷新后作为 Navbar 名称兜底。
+ */
+export function loadWhiteboardName(whiteboardId: string): string | null {
+  try {
+    return localStorage.getItem(STORAGE_NAME_KEY_PREFIX + whiteboardId)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 关键修复（白板名"未命名白板"bug）：保存白板名到 localStorage。
+ */
+export function saveWhiteboardName(whiteboardId: string, name: string): void {
+  try {
+    localStorage.setItem(STORAGE_NAME_KEY_PREFIX + whiteboardId, name)
+  } catch {
+    // localStorage 满 / 禁用，静默失败
+  }
+}
 
 /**
  * 从 localStorage 读取元素

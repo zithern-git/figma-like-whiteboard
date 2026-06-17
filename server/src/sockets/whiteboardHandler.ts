@@ -195,10 +195,17 @@ export function registerWhiteboardHandlers(io: Server, socket: Socket): void {
         // 广播在线列表给房间所有人（含自己，让 UI 立即同步）
         io.to(roomKey(shortId)).emit('online-users', onlineUsers)
 
-        // 推送当前画布状态
+        // 关键修复（白板名"未命名白板"bug）：在 ack payload 中附带白板名。
+        // 原因：客户端 HTTP GET /api/whiteboards/:id 需要 requireRole（owner/editor/viewer），
+        // 某些用户可能不在 collaborators 列表中 → 403 → currentWhiteboard 永远 null
+        // → Navbar 退到 "未命名白板" 兜底。
+        // socket join 不要求角色（任何人能加入协作），所以用 socket ack 携带 name
+        // 是最可靠的来源。客户端缓存到 localStorage 作为刷新后的兜底。
         socket.emit('join-whiteboard-ack', {
           elements: whiteboard.elements,
           onlineUsers,
+          whiteboardName: whiteboard.name,
+          whiteboardShortId: shortId,
           version: Date.now(), // 6.1 用时间戳作 version
         })
         return shortId

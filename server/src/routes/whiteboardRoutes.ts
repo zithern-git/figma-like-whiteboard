@@ -168,11 +168,20 @@ router.post(
 
 /** 查找白板（支持 shortId 或 mongo _id），找不到或已删除时抛 NOT_FOUND */
 async function findWhiteboardOrFail(id: string) {
-  let whiteboard
-  if (mongoose.isValidObjectId(id)) {
+  // 关键修复（白板名"未命名白板" / 404 bug）：
+  // 之前先判断 isValidObjectId(id)，24 位 hex 同时是合法 shortId 和合法 ObjectId，
+  // 优先 findById 查不到（这是 shortId 不是 _id）→ 返回 404 → 客户端 catch 后
+  // currentWhiteboard = null → Navbar 退到"未命名白板"兜底。
+  //
+  // 真实数据：白板 shortId 是 24 位 hex（早期白板用 mongo _id 作为 shortId，
+  // 与 ObjectId 格式完全一致），而 socket join 用 findOne({ shortId }) 直接查
+  // 是成功的（HTTP 路由和 socket 行为不一致）。
+  //
+  // 修复：URL 路由 /whiteboard/:id 的 :id 是 shortId（不是 mongo _id），
+  // **优先按 shortId 查**。如果 shortId 查不到，再尝试 _id 兼容旧路由。
+  let whiteboard = await Whiteboard.findOne({ shortId: id })
+  if (!whiteboard && mongoose.isValidObjectId(id)) {
     whiteboard = await Whiteboard.findById(id)
-  } else {
-    whiteboard = await Whiteboard.findOne({ shortId: id })
   }
   if (!whiteboard || whiteboard.deleted) {
     throw new AppError('NOT_FOUND', 'Whiteboard not found', 404)
