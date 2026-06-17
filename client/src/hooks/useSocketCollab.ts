@@ -19,6 +19,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { io, Socket } from 'socket.io-client'
 import { useCanvasStore, ClientOp, ServerOp } from '@/stores/canvasStore'
+import { useWhiteboardStore } from '@/stores/whiteboardStore'
 import { CanvasElement } from '@/canvas/CanvasElement'
 import { useAuthStore } from '@/stores/authStore'
 import { toast } from '@/stores/toastStore'
