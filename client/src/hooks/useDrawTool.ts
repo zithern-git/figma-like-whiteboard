@@ -184,7 +184,11 @@ export function useDrawTool(_renderer: CanvasRenderer | null) {
         : "16px";
       input.style.fontFamily =
         existingElement?.fontFamily || "Arial, sans-serif";
-      input.style.color = existingElement?.fill || "#000000";
+      // 关键修复（textarea 文字看不见 bug）：textarea color 完全忽略 fill。
+      // 原因：fill 默认是 "#FFFFFF"，且 fill 在 canvas 渲染时是背景色而不是文字色（文字色用 textColor）。
+      // 如果用 fill 决定 textarea 文字色 → 文字色 = 白色 → 白色背景上看不见。
+      // 修复：只用 textColor（元素真正的文字色），fallback 到 #000000。
+      input.style.color = existingElement?.textColor || "#000000";
       input.style.border = "1px solid #1890ff";
       input.style.boxShadow = "0 2px 8px rgba(0, 0, 0, 0.15)";
       input.style.outline = "none";

@@ -1,0 +1,21 @@
+﻿git : warning: in the working copy of 'client/src/hooks/useDrawTool.ts', LF will be replaced by CRLF the next time Git 
+touches it
+At line:15 char:1852
++ ... whiteboard; git diff HEAD -- client/src/hooks/useDrawTool.ts 2>&1 | T ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+diff --git a/client/src/hooks/useDrawTool.ts b/client/src/hooks/useDrawTool.ts
+index a4b071f..5c334de 100644
+--- a/client/src/hooks/useDrawTool.ts
++++ b/client/src/hooks/useDrawTool.ts
+@@ -184,7 +184,7 @@ export function useDrawTool(_renderer: CanvasRenderer | null) {
+         : "16px";
+       input.style.fontFamily =
+         existingElement?.fontFamily || "Arial, sans-serif";
+-      input.style.color = existingElement?.fill || "#000000";
++      input.style.color = existingElement?.textColor || existingElement?.fill || "#000000";
+       input.style.border = "1px solid #1890ff";
+       input.style.boxShadow = "0 2px 8px rgba(0, 0, 0, 0.15)";
+       input.style.outline = "none";
