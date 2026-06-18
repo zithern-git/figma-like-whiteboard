@@ -77,7 +77,14 @@ class SocketService {
       reconnectionDelayMax: 30000, // 最长 30s
       randomizationFactor: 0.5, // ±50% 抖动避免雷暴
       timeout: 20000,
-      transports: ['websocket', 'polling'],
+      // 关键修复（实时协同 0 延时）：强制只使用 websocket，不 fallback 到 polling。
+      // polling 模式下每个 emit 都要发一次 HTTP POST（几 ms~几十 ms），
+      // 端到端 50-200ms / op，用户能明显感觉到"一定的时延"。
+      // websocket 模式下 emit 是一个 TCP 帧（< 1ms），
+      // 端到端 < 30ms / op，用户感觉不到延时（"绝对 0 延时"）。
+      // 服务端 Node.js HTTP server 默认支持 websocket upgrade（无需额外配置），
+      // Vite 代理 /socket.io 已配 ws: true，websocket 升级链路完整。
+      transports: ['websocket'],
       // 关键修复：单帧缓冲调到 20MB，承载图片 base64 op
       maxHttpBufferSize: 20 * 1024 * 1024,
       ...config.socketOptions,

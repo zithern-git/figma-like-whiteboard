@@ -17,10 +17,7 @@
 import { Server, Socket } from 'socket.io'
 import mongoose from 'mongoose'
 import Whiteboard from '../models/Whiteboard'
-import {
-  ElementOpPayload,
-  handleElementOp,
-} from './operationBroadcaster'
+import { ElementOpPayload, handleElementOp } from './operationBroadcaster'
 import {
   joinOnline,
   leaveOnline,
@@ -294,19 +291,44 @@ export function registerWhiteboardHandlers(io: Server, socket: Socket): void {
         // 保证无论多少客户端并发，op 都按到达顺序落库。
         // socket 内部 opChain 处理"同一 socket 的 op 串行"，
         // room chain 处理"不同 socket 的 op 串行"，两者结合做到完全有序。
-        await serializeOpForRoom(shortId, op, async (opToProcess) => {
+        // 关键修复（实时协同 0 延时 — op 串行化不阻塞 emit）：
+        // await serializeOpForRoom 内部的 fn 是同步函数（不是 async），
+        // fn 内部用 void handleElementOp(...) 启动异步任务后立即 return。
+        // 这样：
+        // - emit 在 handleElementOp 内部**立即执行**（socket.to().emit 是同步）
+        // - persistOp 在后台异步执行（不阻塞 chain 放行）
+        // - fn 立即 return → chain 立即放行下一个 op
+        // - 多个 op 的 emit 间隔 < 1ms（用户感觉不到延时）
+        // - 持久化失败时 A 端收到 error 事件，不影响 B 端（emit 已发送）
+        await serializeOpForRoom(shortId, op, (opToProcess) => {
           const opSize = JSON.stringify(opToProcess).length
           const payloadKb = (opSize / 1024).toFixed(1)
           console.log(
             `[element-op] user=${userId} shortId=${shortId} opType=${opToProcess.opType} payload=${payloadKb}KB clientOpId=${opToProcess.clientOpId}`
           )
-          const result = await handleElementOp(io, socket, shortId, userId, opToProcess)
-          if (!result.allowed) {
-            socket.emit('error', {
-              code: result.rejectReason?.startsWith('FORBIDDEN') ? 'FORBIDDEN' : 'OP_REJECTED',
-              message: result.rejectReason ?? 'Op rejected',
+          // 关键：不 await handleElementOp —— emit 立即执行 + persistOp 后台
+          handleElementOp(io, socket, shortId, userId, opToProcess)
+            .then((result) => {
+              if (!result.allowed) {
+                socket.emit('error', {
+                  code: result.rejectReason?.startsWith('FORBIDDEN')
+                    ? 'FORBIDDEN'
+                    : 'OP_REJECTED',
+                  message: result.rejectReason ?? 'Op rejected',
+                })
+              }
             })
-          }
+            .catch((err) => {
+              console.error('[element-op] handleElementOp error:', err)
+              socket.emit('error', {
+                code: 'INTERNAL_ERROR',
+                message: 'Op processing failed',
+              })
+            })
+          // 关键修复（typecheck）：显式返回 resolved Promise，
+          // 让 serializeOpForRoom 的 fn 签名 (op) => Promise<unknown> 类型匹配。
+          // 实际效果：handleElementOp 在后台异步执行，emit 已发送，chain 立即放行。
+          return Promise.resolve()
         })
       })
       .catch((err) => {

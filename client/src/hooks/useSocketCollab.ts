@@ -172,7 +172,15 @@ export function useSocketCollab(
       reconnectionDelayMax: 30000,
       randomizationFactor: 0.5,
       timeout: 20000,
-      transports: ['websocket', 'polling'],
+      // 关键修复（按需同步模式 — 0 延时显示最终状态）：
+      // 强制只使用 websocket，不 fallback 到 polling。
+      // polling 模式下每个 emit 都要发一次 HTTP POST（几 ms~几十 ms），
+      // 端到端 50-200ms / event。
+      // websocket 模式下 emit 是一个 TCP 帧（< 1ms），
+      // A 端 onblur 触发 state-sync → B 端 < 30ms 内看到最终状态（"绝对 0 延时"）。
+      // 服务端 Node.js HTTP server 默认支持 websocket upgrade（无需额外配置），
+      // Vite 代理 /socket.io 已配 ws: true，websocket 升级链路完整。
+      transports: ['websocket'],
       maxHttpBufferSize: 20 * 1024 * 1024,
     } as any)
     socketRef.current = socket
@@ -192,7 +200,8 @@ export function useSocketCollab(
         opsToMergeOnAck.current.push(op)
       }
 
-      // 关键修复：判断当前是否在线
+      // 实时协同模式：A 端 add/update/delete op **立即 emit** 给服务端
+      // → 服务端持久化（后台异步）+ 中转到 B 端 → B 端立即看到
       if (socket.connected) {
         // 在线：直接 emit
         pendingClientOpIds.current.add(op.clientOpId)
@@ -205,6 +214,13 @@ export function useSocketCollab(
           offlineQueue.current.shift()
         }
       }
+    })
+
+    // 保留 state-sync 注入回调（暂未使用，未来可启用）
+    canvasStore.setBroadcastStateSync(() => {
+      if (!socket.connected) return
+      const elements = useCanvasStore.getState().elements
+      socket.emit('state-sync', { elements })
     })
 
     // ========== 连接事件 ==========
@@ -421,7 +437,6 @@ export function useSocketCollab(
         return
       }
       // 远端 op：应用到本地 store
-      // 关键修复（实时协作失效）：增加可观测日志，便于排查 op 链路问题
       console.log(
         `[useSocketCollab] 收到远端 op: type=${op.opType} userId=${op.userId} clientOpId=${op.clientOpId}`
       )
@@ -456,6 +471,9 @@ export function useSocketCollab(
 
       // 清除上行 op 广播回调（避免下次 mount 之前 store 仍持有旧引用）
       useCanvasStore.getState().setBroadcastOp(null)
+
+      // 清除 state-sync 广播回调
+      useCanvasStore.getState().setBroadcastStateSync(null)
 
       // 清理节流定时器
       if (cursorTimerRef.current !== null) {

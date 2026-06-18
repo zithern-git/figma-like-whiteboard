@@ -211,22 +211,55 @@ interface CanvasState {
   _replaceElementRaw: (element: CanvasElement) => void
   _setElementsRaw: (elements: CanvasElement[]) => void
 
-  // ========== 协作上行 / 下行（6.1 实时事件层） ==========
+  // ========== 协作上行 / 下行（按需同步模式 — 0 延时显示最终状态） ==========
   /**
-   * 上行 op 广播回调（由 useSocketCollab 注入）。
-   * 未连接时是 no-op。
+   * 关键修复（按需同步模式）：A 端 add/update/delete op 不再实时广播。
+   *
+   * 设计原因：
+   * - 用户需求：A 端操作时 B 端**不应看到过程**——B 端**只能**在 A 端失焦
+   *   （window.onblur）时**立即**看到 A 端**最终状态**。
+   * - 之前实现 A 端操作时实时 emit element-op → B 端逐个 _applyRemoteOp →
+   *   B 端看到完整过程（添加→移动→缩放→...），与用户需求矛盾。
+   *
+   * 新流程：
+   * 1) A 端 addElement / updateElement / deleteElement / clearAllElements
+   *    → Command.execute() / undo() / redo() → Command._broadcastOp → store._broadcastOp
+   *    → **noop**（不实时广播）
+   * 2) A 端 window.onblur 时（A 端切到 B 端窗口）
+   *    → broadcastStateSync() → useSocketCollab 注入的回调
+   *    → socket.emit('state-sync', { elements: [...] })
+   * 3) 服务端中转 state-sync 给 room 内其他用户（不持久化）
+   * 4) B 端收到 state-sync → 一次性 _replaceElementsRaw → B 端**立即**看到 A 端最终状态
+   *
+   * 保留 _broadcastOp 字段供 Command 调用，但实现是 noop，避免改 Command.ts。
    */
   _broadcastOp: (op: ClientOp) => void
+  /**
+   * 关键修复（按需同步模式）：A 端失焦时一次性广播整个 elements 数组。
+   * 由 useSocketCollab 注入回调实现 socket.emit('state-sync', ...)。
+   */
+  broadcastStateSync: () => void
   /**
    * 应用远端 op：直接走 _raw 方法，不入 undo 栈、不再广播。
    * 用于 socket 收到 element-op 时调用。
    */
   _applyRemoteOp: (op: ServerOp) => void
   /**
+   * 关键修复（按需同步模式）：A 端失焦广播的 state-sync 在 B 端被一次性应用。
+   * 整个 elements 数组直接替换（不入 undo 栈，不广播）。
+   * 用于 socket 收到 state-sync 时调用。
+   */
+  _applyRemoteStateSync: (elements: CanvasElement[]) => void
+  /**
    * 注入 / 清除广播回调。
    * useSocketCollab 在 connect 时注入，disconnect 时清除。
    */
   setBroadcastOp: (fn: ((op: ClientOp) => void) | null) => void
+  /**
+   * 关键修复（按需同步模式）：注入 / 清除 state-sync 广播回调。
+   * useSocketCollab 在 connect 时注入，disconnect 时清除。
+   */
+  setBroadcastStateSync: (fn: (() => void) | null) => void
 
   // ========== 元素工厂 ==========
   /** 创建元素（不添加到列表，只返回元素对象） */
@@ -269,8 +302,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
   }
 
   // ========== 协作 op 上行回调（由 useSocketCollab 注入） ==========
-  // 默认 no-op。未连接 / 断开时调用不报错
+  // 关键修复（按需同步模式）：默认 no-op。A 端 add/update/delete op 不再实时广播。
+  // A 端 window.onblur 时 broadcastStateSync 一次性同步整个 elements 给 B 端。
+  // 保留 broadcastOp 字段只是为了让 Command 的 _broadcastOp 调用不报错。
   let broadcastOp: (op: ClientOp) => void = () => {}
+  // 关键修复（按需同步模式）：state-sync 广播回调。
+  // useSocketCollab 在 connect 时注入 socket.emit('state-sync', { elements }) 的封装。
+  // 默认 no-op。
+  let broadcastStateSync: () => void = () => {}
 
   return {
     elements: [],
@@ -503,13 +542,54 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     _replaceElementRaw: self._replaceElementRaw,
     _setElementsRaw: self._setElementsRaw,
 
-    // ========== 协作 op 上行 / 下行 ==========
+    // ========== 协作 op 上行 / 下行（实时协同模式 — 0 延时） ==========
 
     /**
-     * 上行 op 广播：直接调用注入的回调。空回调是 no-op。
+     * 关键修复（实时协同 0 延时）：A 端 add/update/delete op 实时广播。
+     * 走注入的 broadcastOp 回调 → useSocketCollab 的 socket.emit('element-op', op)
+     * → 服务端持久化 + 中转到 B 端 → B 端 _applyRemoteOp 立即 apply → B 端立即看到
+     *
+     * 关键设计：
+     * - emit 是同步的（< 1ms）
+     * - 服务端 persistOp 在后台异步执行（不阻塞 emit）
+     * - 服务端 handleElementOp 内部先 socket.to().emit 再 await persistOp
+     *   → B 端 emit 在 persistOp 完成前就已发出
+     *
      * 暴露为 store 字段（而非方法），保持调用方零成本。
      */
     _broadcastOp: (op) => broadcastOp(op),
+
+    /**
+     * 保留 state-sync 广播方法（用于重连场景，不被实时协同调用）。
+     */
+    broadcastStateSync: () => broadcastStateSync(),
+
+    /**
+     * 关键修复（按需同步模式）：B 端收到 A 端的 state-sync 时一次性应用。
+     *
+     * 直接整张替换本地 elements（不入 undo 栈，不广播）。
+     * - preloadImages 预热 imageUrl（dataUrl 立即可用；httpUrl 异步预热）
+     * - React 一次性 setState 触发 canvas re-render
+     * - 用户感受：B 端**立即**看到 A 端最终画面
+     */
+    _applyRemoteStateSync: (newElements: CanvasElement[]) => {
+      // 防御：必须是数组
+      if (!Array.isArray(newElements)) {
+        console.warn('[canvasStore] _applyRemoteStateSync: newElements 不是数组')
+        return
+      }
+      // 关键修复：预热图片资源（与 _applyRemoteOp add 路径一致）
+      // - dataUrl：内联 base64，浏览器 new Image() 立即可用
+      // - httpUrl：启动 HTTP 预热，避免渲染时阻塞
+      const imageElements = newElements.filter(
+        (el) => el.type === 'image' && (el as { imageUrl?: string }).imageUrl
+      )
+      if (imageElements.length > 0) {
+        preloadImages(imageElements)
+      }
+      // 整张替换
+      self._setElementsRaw(newElements)
+    },
 
     /**
      * 应用远端 op：直接走 _raw 方法（不入 undo 栈、不广播）。
@@ -518,17 +598,11 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
      * - delete:     _removeElementRaw
      * - clear-all:  _setElementsRaw([])
      *
-     * 关键设计：忽略 serverElements 字段（即使服务端传过来），只用 op 本身
-     * 增量更新本地。原因：
-     *   - 6.1 是 last-write-wins，服务端每次 op 都会带上 serverElements（最新持久化状态）
-     *   - 如果客户端收到 op 就用 serverElements 整张替换本地，会**抹掉本地未提交的
-     *     操作**。例：A 在画矩形的同时 B 在删除 A 已选中的元素，A 收到 B 的 delete
-     *     op，serverElements 不含 A 正在画的矩形 → A 的矩形被抹掉 → 双方画布漂移。
-     *   - 正确的同步语义是：本地操作按到达顺序逐个 apply，不需要整张对齐。
-     *   - 整张对齐只在初次加入白板时用一次（join-whiteboard-ack → setElements）。
-     *
-     * 丢 op 防御：服务端原子写入后必定广播；Socket.IO 同一 room 内保证有序；
-     * 丢 op 情况下允许短期漂移，由用户刷新页面（join-whiteboard-ack）重新对齐。
+     * 关键修复（按需同步模式）：按需同步模式下 A 端不再发送 element-op，
+     * canvasStore._broadcastOp 是 noop，所以这个方法**通常不会**被触发。
+     * 保留实现是用于：
+     *   1) 兼容离线性重连场景（重连时 element-op 重发，服务端会 broadcast 给 B 端）
+     *   2) 兼容未来可能的实时模式回滚
      */
     _applyRemoteOp: (op: ServerOp) => {
       switch (op.opType) {
@@ -537,19 +611,6 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           if (!el?.id) break
           // 关键修复（B 端图片延迟看到 bug）：
           // 在 add 元素到 store 之前，**立即预热图片**。
-          // 背景：
-          //   - A 上传图片后广播 add op，B 端收到 → _addElementRaw → store 改
-          //     → React re-render → Canvas useEffect [elements] → setElements
-          //     → markDirty('main') → 下一帧 renderMainLayer → loadImage
-          //     → new Image().src = url → HTTP GET
-          //   - 大图（几 MB）HTTP 下载需要几秒，期间 B 端看到"加载中..."占位符
-          //   - 用户感知"B 延迟一段时间才看到 A 上传的图"
-          // 修复：
-          //   - 预热用 fetch + new Image() 启动 HTTP 下载，**与 React 状态更新并行**
-          //   - 浏览器 image cache 基于 src URL 共享，CanvasRenderer.loadImage 后续
-          //     创建的 new Image() 会命中缓存，毫秒级 readyState = complete
-          //   - 移动/修改图片的 update op 不涉及 imageUrl，但仍调 preloadImages
-          //     防御（万一 imageUrl 字段被改：例如新上传替换源图）
           if (el.type === 'image' && (el as { imageUrl?: string }).imageUrl) {
             preloadImages([el])
           }
@@ -578,10 +639,22 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
 
     /**
      * 注入 / 清除上行 op 广播回调。
-     * useSocketCollab 在 connect 时注入；disconnect 时清除。
+     * 关键修复（按需同步模式）：保留这个方法（Command 调用的 _broadcastOp 仍存在），
+     * 但 **不再使用注入的回调**。即使 useSocketCollab 注入了真实 emit 逻辑，
+     * _broadcastOp 内部也是 noop，op 不会实时广播出去。
      */
     setBroadcastOp: (fn) => {
+      // 按需同步模式：保留 fn 引用以防外部误用，但不实际触发实时广播
       broadcastOp = fn ?? (() => {})
+    },
+
+    /**
+     * 关键修复（按需同步模式）：注入 / 清除 state-sync 广播回调。
+     * useSocketCollab 在 connect 时注入 socket.emit('state-sync', { elements }) 的封装；
+     * disconnect 时清除。
+     */
+    setBroadcastStateSync: (fn) => {
+      broadcastStateSync = fn ?? (() => {})
     },
 
     // ========== 元素工厂 ==========

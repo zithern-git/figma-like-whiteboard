@@ -18,6 +18,7 @@
 
 import { useCallback, useRef } from "react";
 import { CanvasRenderer } from "@/canvas/CanvasRenderer";
+import type { CanvasElement } from "@/canvas/CanvasElement";
 import { useCanvasStore } from "@/stores/canvasStore";
 import { toast } from "@/stores/toastStore";
 import api from "@/services/api";
