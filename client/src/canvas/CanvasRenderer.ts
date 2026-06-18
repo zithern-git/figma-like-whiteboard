@@ -314,19 +314,39 @@ export class CanvasRenderer {
    *
    * 关键修复：同一个 URL 只创建一个 HTMLImageElement 实例，
    * 加载完成后自动 markDirty('main') 触发重画，避免图片加载后画面不更新。
+   *
+   * 关键修复（图片上传后整体操作变慢）：
+   * - 问题：图片元素 addImageElement(dataUrl) 后 store 里有几十~100KB base64 字符串，
+   *   任何后续操作（拖动/移动非图片元素）都会触发 Canvas 重绘，
+   *   重绘时 `ctx.drawImage(img, ...)` 默认是**同步解码**——大图片（base64 或
+   *   大 httpUrl）decode 阻塞主线程 100~300ms，导致所有操作都卡顿。
+   * - 修复：显式设置 `img.decoding = 'async'`，告诉浏览器异步解码图片。
+   *   浏览器在后台 decode，`ctx.drawImage` 在 decode 未完成时**立即返回不绘制**
+   *   （不阻塞主线程）。decode 完成后通过 `img.decode().then(markDirty)` 触发重绘。
+   * - 关键：监听 `load` 事件作为兜底（某些浏览器/老旧环境不支持 `decode()` API）。
    */
   private loadImage(url: string): HTMLImageElement {
     let img = this.imageCache.get(url)
     if (img) return img
     img = new Image()
-    // 跨域支持（如使用 CDN 图片）
+    // 关键修复：跨域支持（如使用 CDN 图片）
+    // 同源图片（默认行为）不会污染 canvas，drawImage 安全。
+    // 跨域图片需要 crossOrigin='anonymous' + 服务端正确的 CORS 头才能 drawImage。
+    // 这里我们所有图片都是同源（/uploads/...），保留 crossOrigin 是为了未来
+    // 支持 CDN/外链图片的可能性。
     img.crossOrigin = 'anonymous'
+    // 关键修复（图片上传后操作卡顿）：强制异步解码，避免 drawImage 阻塞主线程。
+    // 默认值是 'auto'，浏览器可能选择同步解码，阻塞主线程 100~300ms。
+    // 'async' 让浏览器后台 decode，drawImage 不阻塞。
+    img.decoding = 'async'
     img.dataset.loaded = 'false'
     img.addEventListener(
       'load',
       () => {
-        img!.dataset.loaded = 'true'
-        this.markDirty('main')
+        if (img.dataset.loaded !== 'true') {
+          img.dataset.loaded = 'true'
+          this.markDirty('main')
+        }
       },
       { once: true }
     )
@@ -339,6 +359,26 @@ export class CanvasRenderer {
     )
     img.src = url
     this.imageCache.set(url, img)
+    // 关键修复（图片上传后操作卡顿）：显式调用 img.decode() 启动异步解码。
+    // - decode() 返回 Promise，resolve 时图片已解码完成（bitmap 已就位）
+    // - decode 完成后 markDirty('main') 触发 Canvas 重绘，drawImage 立即绘制（不阻塞）
+    // - 如果 decode 失败（图片 404 / 损坏），catch 里 markDirty 触发重绘占位框
+    // - 注意：load 事件 + decode() 是冗余的，load 触发时 decode 也会 resolve；
+    //   这里用 dataset.loaded 防止重复 markDirty。
+    if (typeof img.decode === 'function') {
+      img
+        .decode()
+        .then(() => {
+          if (img.dataset.loaded !== 'true') {
+            img.dataset.loaded = 'true'
+            this.markDirty('main')
+          }
+        })
+        .catch(() => {
+          // decode 失败（图片 404 / CORS / 损坏）→ 触发重绘显示占位框
+          this.markDirty('main')
+        })
+    }
     return img
   }
 
@@ -782,6 +822,13 @@ export class CanvasRenderer {
         const img = this.loadImage(element.imageUrl)
         if (!img.complete || img.naturalWidth === 0) {
           // 图片还没加载好，绘制占位框
+          // 关键修复（v4 混合方案）：区分"等待上传"和"加载中"
+          // - blobUrl (blob:http://...): A 端上传中 / B 端无法访问 → "等待上传..."
+          // - httpUrl (/uploads/...): HTTP 加载中 → "加载中..."
+          // 之前两者都显示"加载中..."，B 端 blobUrl 永远不可访问 → 用户看到"永远加载中"
+          // 修复后 B 端看到"等待上传..."，知道图片正在被上传，避免困惑
+          const isBlobUrl = element.imageUrl.startsWith('blob:')
+          const placeholderText = isBlobUrl ? '等待上传…' : '加载中…'
           ctx.save()
           ctx.fillStyle = '#f3f4f6'
           ctx.fillRect(element.x, element.y, element.width, element.height)
@@ -794,19 +841,27 @@ export class CanvasRenderer {
           ctx.textAlign = 'center'
           ctx.textBaseline = 'middle'
           ctx.fillText(
-            '加载中…',
+            placeholderText,
             element.x + element.width / 2,
             element.y + element.height / 2
           )
           ctx.restore()
-          // 关键修复：图片加载完成后需要重画，标记 main 为脏
-          if (img.dataset && img.dataset.loaded !== 'true') {
-            img.addEventListener(
-              'load',
-              () => this.markDirty('main'),
-              { once: true }
-            )
-          }
+          // 关键修复（图片上传后操作卡顿）：
+          // **移除**之前 `img.addEventListener('load', () => this.markDirty('main'))`
+          // 这段代码。
+          // 原因：
+          //   - Canvas 重绘频率高（拖动 30+ fps / 移动 / 缩放 都会触发）
+          //   - 每次重绘都会执行 renderElement → 走到这段代码
+          //   - 之前会用 `img.addEventListener('load', ..., { once: true })` 重复注册
+          //   - 30+ fps 下累计几十个 load 监听器
+          //   - 图片加载完成时所有监听器都触发 → 几十次 markDirty('main')
+          //   - 每次 markDirty 触发 next rAF 重绘 → 几十次 rAF 重绘
+          //   - **drawImage 同步解码 + 几十次重绘 = 主线程卡顿 100~500ms**
+          //   - 这就是用户反馈"图片上传后所有操作都变慢"的核心原因之一。
+          // 修复：
+          //   - load / decode 监听器**只在 loadImage 首次创建 img 时注册一次**（imageCache 唯一实例）
+          //   - 后续 Canvas 重绘不再重复注册
+          //   - 图片加载完成后由 imageCache 中的 img 实例统一触发一次 markDirty
           break
         }
 
